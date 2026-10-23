@@ -1,10 +1,10 @@
 """Disk-backed online graph construction for the batch updater.
 
 This module is the first downstream consumer of the streamed link-prediction
-arrays. It builds the same temporary online graph as
-``fingerprint_update._make_online_graph`` without constructing its
-candidate-sized Python edge tuples. The virtual-edge rule remains exact cosine
-thresholding; its time complexity is still quadratic in sample count.
+arrays. It builds the same temporary online graph as the eager updater without
+constructing candidate-sized Python edge tuples. Virtual edges and bounded
+negative pairs use normalized RSSI rows; coordinates remain in GNN node and
+edge vectors. Pair enumeration is still quadratic in sample count.
 
 The returned numeric arrays are read-only NumPy memmaps. Stable IDs and small
 lineage/configuration metadata stay in the JSON manifest.
@@ -20,16 +20,28 @@ import sqlite3
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from time import monotonic
+from typing import Callable, Literal
 
 import numpy as np
 import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ae import EncoderFeatureArtifact
-from graph_build import GraphBuildConfig, _graph_id, _pseudo_location
+from graph_build import (
+    GraphBuildConfig,
+    _graph_id,
+    _pseudo_location,
+    resolve_spatial_transform,
+)
 from gufu_artifacts import atomic_write_json, canonical_json_digest, read_json_text, sha256_file
 from gufu_data import PreparedDataset, raw_dbm_row_to_ae, rssi_dbm_to_graph_weight
+from spatial_normalization import normalized_position_feature
+from rssi_pairs import (
+    BoundedNegativeSampler,
+    RSSI_SIMILARITY_SPACE,
+    normalized_rssi_cosine,
+)
 from lp_streaming import (
     StreamArrayArtifact,
     StreamingLPInputManifest,
@@ -49,7 +61,7 @@ from lp import LinkPredictionConfig
 from graph_build import SampleLocationInitialization
 
 
-ONLINE_GRAPH_FORMAT = "gufu_streaming_online_graph_v1"
+ONLINE_GRAPH_FORMAT = "gufu_streaming_online_graph_v4"
 
 
 class StreamingOnlineGraphManifest(BaseModel):
@@ -57,7 +69,7 @@ class StreamingOnlineGraphManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_online_graph_v1"] = ONLINE_GRAPH_FORMAT
+    format: Literal["gufu_streaming_online_graph_v4"] = ONLINE_GRAPH_FORMAT
     online_graph_id: str = Field(pattern=r"^onlinegraph:[0-9a-f]{64}$")
     dataset_id: str
     reference_batch_id: str
@@ -75,6 +87,11 @@ class StreamingOnlineGraphManifest(BaseModel):
     vocabulary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     graph_build_config: GraphBuildConfig
     virtual_edge_sigma: float = Field(ge=-1.0, le=1.0)
+    similarity_feature_space: Literal[
+        "normalized_rssi_cosine_min_overlap_v1"
+    ] = (
+        RSSI_SIMILARITY_SPACE
+    )
     encoder_feature_dim: int = Field(ge=1)
     node_feature_dim: int = Field(ge=3)
     node_ids: tuple[str, ...]
@@ -91,18 +108,26 @@ class StreamingOnlineGraphManifest(BaseModel):
             "new_or_reactivated_ap_graph_mean",
             "post_transition_ae_reencoded_reference_sample",
             "post_transition_reference_ap_weighted_mean",
+            "new_encoder_feature_plus_unavailable_position",
         ], ...
     ]
+    sample_location_initializations: tuple[SampleLocationInitialization, ...]
+    sample_position_available_mask: tuple[bool, ...]
     labeled_reference_ids: tuple[str, ...]
     labeled_reference_coordinates: tuple[tuple[float, float], ...]
     radio_edge_count: int = Field(ge=0)
     virtual_edge_count: int = Field(ge=0)
+    negative_pair_count: int = Field(ge=0)
     adjacency_shape: tuple[int, int]
     adjacency_nonzero_count: int = Field(ge=0)
     arrays: tuple[StreamArrayArtifact, ...]
 
     @model_validator(mode="after")
     def aligned_identity(self):
+        if self.virtual_edge_sigma != self.graph_build_config.virtual_edge_sigma:
+            raise ValueError("streamed online sigma must match its graph-build config")
+        if self.similarity_feature_space != self.graph_build_config.similarity_feature_space:
+            raise ValueError("streamed online similarity space must match graph-build config")
         if self.node_ids != self.sample_node_ids + self.ap_node_ids:
             raise ValueError("online node rows must be samples followed by APs")
         if self.sample_node_ids != self.reference_sample_ids + self.update_sample_ids:
@@ -115,8 +140,36 @@ class StreamingOnlineGraphManifest(BaseModel):
             raise ValueError("online graph node types do not align")
         if len(self.node_feature_sources) != len(self.node_ids):
             raise ValueError("online feature provenance must align with node IDs")
+        if len(self.sample_location_initializations) != len(self.sample_node_ids):
+            raise ValueError("online sample location metadata must align with sample IDs")
+        if tuple(item.scan_id for item in self.sample_location_initializations) != self.sample_node_ids:
+            raise ValueError("online sample locations must follow sample row order")
+        if len(self.sample_position_available_mask) != len(self.sample_node_ids):
+            raise ValueError("online position availability must align with sample IDs")
+        if any(
+            available and initialization.source != "bootstrap_reference_label"
+            for available, initialization in zip(
+                self.sample_position_available_mask, self.sample_location_initializations
+            )
+        ):
+            raise ValueError("available online positions must have bootstrap label provenance")
+        available_ids = {
+            scan_id
+            for scan_id, available in zip(
+                self.sample_node_ids, self.sample_position_available_mask
+            )
+            if available
+        }
+        if available_ids != set(self.labeled_reference_ids):
+            raise ValueError("online position availability must match labeled reference IDs")
         if self.node_feature_dim != self.encoder_feature_dim + 2:
             raise ValueError("online graph width must equal encoder width plus XY")
+        if self.graph_build_config.spatial_normalization_enabled:
+            metadata = self.graph_build_config.spatial_transform_metadata
+            if metadata is None or self.graph_build_config.spatial_transform_sha256 is None:
+                raise ValueError("online graph must record its fitted spatial transform")
+            if metadata.site_id != self.dataset_id:
+                raise ValueError("online graph spatial transform belongs to another site")
         if len(self.labeled_reference_ids) != len(self.labeled_reference_coordinates):
             raise ValueError("bootstrap label IDs and coordinates must align")
         if not set(self.labeled_reference_ids) <= set(self.reference_sample_ids):
@@ -130,6 +183,8 @@ class StreamingOnlineGraphManifest(BaseModel):
         names = tuple(item.name for item in self.arrays)
         expected = {
             "node_features.npy",
+            "sample_signal_features.npy",
+            "sample_signal_masks.npy",
             "radio_endpoints.npy",
             "radio_weights.npy",
             "radio_edge_features.npy",
@@ -137,6 +192,9 @@ class StreamingOnlineGraphManifest(BaseModel):
             "virtual_endpoints.npy",
             "virtual_similarities.npy",
             "virtual_edge_features.npy",
+            "negative_endpoints.npy",
+            "negative_similarities.npy",
+            "negative_strengths.npy",
             "update_reference_indptr.npy",
             "update_reference_cols.npy",
             "update_reference_values.npy",
@@ -146,6 +204,14 @@ class StreamingOnlineGraphManifest(BaseModel):
         shapes = {item.name: item.shape for item in self.arrays}
         expected_shapes = {
             "node_features.npy": (len(self.node_ids), self.node_feature_dim),
+            "sample_signal_features.npy": (
+                len(self.sample_node_ids),
+                len(self.bssid_vocabulary),
+            ),
+            "sample_signal_masks.npy": (
+                len(self.sample_node_ids),
+                len(self.bssid_vocabulary),
+            ),
             "radio_endpoints.npy": (self.radio_edge_count, 2),
             "radio_weights.npy": (self.radio_edge_count,),
             "radio_edge_features.npy": (self.radio_edge_count, self.node_feature_dim),
@@ -153,6 +219,9 @@ class StreamingOnlineGraphManifest(BaseModel):
             "virtual_endpoints.npy": (self.virtual_edge_count, 2),
             "virtual_similarities.npy": (self.virtual_edge_count,),
             "virtual_edge_features.npy": (self.virtual_edge_count, self.node_feature_dim),
+            "negative_endpoints.npy": (self.negative_pair_count, 2),
+            "negative_similarities.npy": (self.negative_pair_count,),
+            "negative_strengths.npy": (self.negative_pair_count,),
             "update_reference_indptr.npy": (len(self.update_sample_ids) + 1,),
             "update_reference_cols.npy": (self.adjacency_nonzero_count,),
             "update_reference_values.npy": (self.adjacency_nonzero_count,),
@@ -172,6 +241,8 @@ class MappedStreamingOnlineGraph:
     directory: Path
     manifest: StreamingOnlineGraphManifest
     node_features: np.ndarray
+    sample_signal_features: np.ndarray
+    sample_signal_masks: np.ndarray
     radio_endpoints: np.ndarray
     radio_weights: np.ndarray
     radio_edge_features: np.ndarray
@@ -179,6 +250,9 @@ class MappedStreamingOnlineGraph:
     virtual_endpoints: np.ndarray
     virtual_similarities: np.ndarray
     virtual_edge_features: np.ndarray
+    negative_endpoints: np.ndarray
+    negative_similarities: np.ndarray
+    negative_strengths: np.ndarray
     update_reference_indptr: np.ndarray
     update_reference_cols: np.ndarray
     update_reference_values: np.ndarray
@@ -263,14 +337,17 @@ def build_streaming_online_graph(
     output_directory: str | Path,
     *,
     virtual_edge_sigma: float,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> StreamingOnlineGraphManifest:
     """Build disk-backed temporary graph state directly from the streamed LP.
 
     The procedure uses exactly the local updater's initialized feature spaces:
     reference node features come from the selected reference GNN artifact;
     update sample/AP features come from ``build_graph_state``; newly measured
-    update radio-edge vectors are endpoint means; virtual similarities use the
-    augmented ``z_encoder || XY`` vectors and strict ``cosine > sigma``.
+    update radio-edge vectors are endpoint means; virtual similarities use
+    normalized RSSI rows and strict ``cosine > sigma``. Bounded negative pairs
+    use the same RSSI rows with a separate conservative threshold. The full
+    ``z_encoder || XY`` vectors remain in node and edge features.
     Update evaluation coordinates are not read for labels or initialization.
     """
     if not math.isfinite(virtual_edge_sigma) or not -1.0 <= virtual_edge_sigma <= 1.0:
@@ -305,12 +382,19 @@ def build_streaming_online_graph(
         raise ValueError("update encoder normalization differs from reference")
     if update_encoder_features.checkpoint_sha256 != input_manifest.encoder_checkpoint_sha256:
         raise ValueError("update encoder does not use the reference AE checkpoint")
+    if update_encoder_features.feature_dim != input_manifest.encoder_feature_dim:
+        raise ValueError("update encoder feature width differs from reference graph")
     if update_encoder_features.feature_dim + 2 != input_manifest.node_feature_dim:
         raise ValueError("update graph feature width differs from reference graph")
     if input_manifest.graph_build_config.virtual_edge_strategy != "paper_cosine_threshold":
         raise ValueError("streaming updater requires paper cosine-threshold graph configuration")
     if virtual_edge_sigma != input_manifest.graph_build_config.virtual_edge_sigma:
         raise ValueError("online virtual sigma must match the recorded graph configuration")
+    resolved_build_config, spatial_transform = resolve_spatial_transform(
+        input_manifest.graph_build_config, input_manifest.dataset_id
+    )
+    if resolved_build_config != input_manifest.graph_build_config:
+        raise ValueError("online graph spatial configuration was not fully resolved at bootstrap")
 
     reference_sample_ids = input_manifest.sample_node_ids
     update_sample_ids = tuple(scan.scan_id for scan in update_prepared.scans)
@@ -383,18 +467,53 @@ def build_streaming_online_graph(
         node_features = _open_array(
             staging / "node_features.npy", "float64", (len(node_ids), feature_dim)
         )
+        sample_signal_features = _open_array(
+            staging / "sample_signal_features.npy",
+            "float64",
+            (len(sample_ids), len(input_manifest.bssid_vocabulary)),
+        )
+        sample_signal_masks = _open_array(
+            staging / "sample_signal_masks.npy",
+            "uint8",
+            (len(sample_ids), len(input_manifest.bssid_vocabulary)),
+        )
         node_sources: list[str] = []
         for row, node_id in enumerate(reference_sample_ids):
             node_features[row] = mapped.node_features[input_rows[node_id]]
+            sample_signal_features[row] = mapped.sample_signal_features[row]
+            sample_signal_masks[row] = mapped.sample_signal_masks[row]
             node_sources.append("current_reference_gnn_state")
+        update_rssi_rows = update_prepared.ae_matrix()
+        update_rssi_masks = update_prepared.mask_matrix()
         for node_id in update_sample_ids:
-            encoder_row = update_encoder_features.feature_matrix[
-                update_encoder_rows[node_id]
-            ]
-            node_features[new_rows[node_id]] = tuple(encoder_row) + tuple(
-                update_pseudo_locations[node_id]
+            update_row = update_encoder_rows[node_id]
+            signal_mask = update_rssi_masks[update_row]
+            signal_row = tuple(
+                float(value) if observed else 0.0
+                for value, observed in zip(update_rssi_rows[update_row], signal_mask)
             )
-            node_sources.append("new_encoder_feature_plus_seeded_pseudo_xy")
+            sample_signal_features[new_rows[node_id]] = signal_row
+            sample_signal_masks[new_rows[node_id]] = signal_mask
+            encoder_row = update_encoder_features.feature_matrix[update_row]
+            position_raw = update_pseudo_locations[node_id]
+            if spatial_transform is None:
+                position_feature = position_raw
+                source = "new_encoder_feature_plus_seeded_pseudo_xy"
+            else:
+                # Update truth is unavailable to the GNN. Keep the seeded raw
+                # initialization in metadata, but feed a finite zero block.
+                position_normalized = normalized_position_feature(
+                    spatial_transform,
+                    position_raw,
+                    available=False,
+                )
+                position_feature = tuple(
+                    float(value) * input_manifest.graph_build_config.position_weight
+                    for value in position_normalized
+                )
+                source = "new_encoder_feature_plus_unavailable_position"
+            node_features[new_rows[node_id]] = tuple(encoder_row) + tuple(position_feature)
+            node_sources.append(source)
         update_ap_row = {ap_id: row for row, ap_id in enumerate(update_ap_ids)}
         update_ap_weight_sums = np.zeros((len(update_ap_ids),), dtype=np.float64)
         update_ap_feature_sums = np.zeros(
@@ -434,6 +553,10 @@ def build_streaming_online_graph(
                 node_sources.append("new_or_reactivated_ap_graph_mean")
         if isinstance(node_features, np.memmap):
             node_features.flush()
+        if isinstance(sample_signal_features, np.memmap):
+            sample_signal_features.flush()
+        if isinstance(sample_signal_masks, np.memmap):
+            sample_signal_masks.flush()
 
         # SQLite gives a bounded-RAM stable external sort and duplicate-pair
         # rejection while preserving the exact lexical edge order expected by
@@ -530,35 +653,78 @@ def build_streaming_online_graph(
         label_col = {scan_id: col for col, scan_id in enumerate(labeled_ids)}
         update_row = {scan_id: row for row, scan_id in enumerate(update_sample_ids)}
         lexical_samples = tuple(sorted(sample_ids))
-        row_norms = np.zeros((len(sample_ids),), dtype=np.float64)
-        for scan_id in sample_ids:
-            values = node_features[new_rows[scan_id]]
-            row_norms[new_rows[scan_id]] = math.sqrt(
-                sum(float(value) * float(value) for value in values)
-            )
+        sample_row = {scan_id: row for row, scan_id in enumerate(sample_ids)}
+        pair_sampler = BoundedNegativeSampler(
+            lexical_samples,
+            negative_similarity_threshold=input_manifest.graph_build_config.negative_similarity_threshold,
+            max_pairs_per_sample=input_manifest.graph_build_config.max_negative_pairs_per_sample,
+        )
+        pair_comparison_count = len(lexical_samples) * (len(lexical_samples) - 1) // 2
 
-        def qualifying_pairs():
+        def scored_pairs(pass_name: str):
+            checked_pairs = 0
+            started_at = last_progress_at = monotonic()
+            progress_step = max(
+                1, min(50_000, math.ceil(pair_comparison_count / 20))
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    f"[pipeline] RSSI pair pass '{pass_name}' started: "
+                    f"{len(lexical_samples):,} samples, "
+                    f"{pair_comparison_count:,} possible pairs"
+                )
             for left_pos, left_id in enumerate(lexical_samples):
-                left = node_features[new_rows[left_id]]
-                left_norm = row_norms[new_rows[left_id]]
+                left = sample_signal_features[sample_row[left_id]]
                 for right_pos in range(left_pos + 1, len(lexical_samples)):
+                    checked_pairs += 1
                     right_id = lexical_samples[right_pos]
-                    right = node_features[new_rows[right_id]]
-                    right_norm = row_norms[new_rows[right_id]]
-                    if left_norm == 0.0 or right_norm == 0.0:
-                        continue
-                    similarity = _cosine(left, right)
-                    if similarity is not None and similarity > virtual_edge_sigma:
-                        yield left_id, right_id, similarity
+                    right = sample_signal_features[sample_row[right_id]]
+                    similarity = normalized_rssi_cosine(
+                        left,
+                        right,
+                        sample_signal_masks[sample_row[left_id]],
+                        sample_signal_masks[sample_row[right_id]],
+                        minimum_shared_aps=input_manifest.graph_build_config.minimum_shared_aps,
+                    )
+                    if progress_callback is not None and (
+                        checked_pairs == 1
+                        or checked_pairs % progress_step == 0
+                        or checked_pairs % 1024 == 0
+                    ):
+                        now = monotonic()
+                        if (
+                            checked_pairs == 1
+                            or checked_pairs % progress_step == 0
+                            or now - last_progress_at >= 10.0
+                        ):
+                            progress_callback(
+                                f"[pipeline] RSSI pair pass '{pass_name}': "
+                                f"{checked_pairs:,}/{pair_comparison_count:,} pairs "
+                                f"({checked_pairs / max(1, pair_comparison_count):.0%}); "
+                                f"elapsed={now - started_at:.1f}s"
+                            )
+                            last_progress_at = now
+                    if similarity is not None:
+                        yield left_pos, right_pos, left_id, right_id, similarity
+            if progress_callback is not None:
+                progress_callback(
+                    f"[pipeline] RSSI pair pass '{pass_name}' complete: "
+                    f"{checked_pairs:,}/{pair_comparison_count:,} pairs; "
+                    f"elapsed={monotonic() - started_at:.1f}s"
+                )
 
         virtual_count = 0
         adjacency_counts = np.zeros((len(update_sample_ids),), dtype=np.int64)
-        for left_id, right_id, _similarity in qualifying_pairs():
-            virtual_count += 1
-            if left_id in update_row and right_id in label_col:
-                adjacency_counts[update_row[left_id]] += 1
-            elif right_id in update_row and left_id in label_col:
-                adjacency_counts[update_row[right_id]] += 1
+        for left_pos, right_pos, left_id, right_id, similarity in scored_pairs("mine relations"):
+            if similarity > virtual_edge_sigma:
+                virtual_count += 1
+                if left_id in update_row and right_id in label_col:
+                    adjacency_counts[update_row[left_id]] += 1
+                elif right_id in update_row and left_id in label_col:
+                    adjacency_counts[update_row[right_id]] += 1
+            elif similarity <= input_manifest.graph_build_config.negative_similarity_threshold:
+                pair_sampler.add(left_pos, right_pos, similarity)
+        negative_pairs = pair_sampler.selected()
 
         virtual_endpoints = _open_array(
             staging / "virtual_endpoints.npy", "int64", (virtual_count, 2)
@@ -569,6 +735,22 @@ def build_streaming_online_graph(
         virtual_features = _open_array(
             staging / "virtual_edge_features.npy", "float64", (virtual_count, feature_dim)
         )
+        negative_endpoints = _open_array(
+            staging / "negative_endpoints.npy", "int64", (len(negative_pairs), 2)
+        )
+        negative_similarities = _open_array(
+            staging / "negative_similarities.npy", "float64", (len(negative_pairs),)
+        )
+        negative_strengths = _open_array(
+            staging / "negative_strengths.npy", "float64", (len(negative_pairs),)
+        )
+        for index, pair in enumerate(negative_pairs):
+            negative_endpoints[index] = (
+                sample_row[pair.left_sample_id],
+                sample_row[pair.right_sample_id],
+            )
+            negative_similarities[index] = pair.signal_cosine_similarity
+            negative_strengths[index] = pair.negative_strength
         adjacency_indptr = _prefix(adjacency_counts)
         np.save(staging / "update_reference_indptr.npy", adjacency_indptr, allow_pickle=False)
         adjacency_cols = _open_array(
@@ -583,7 +765,9 @@ def build_streaming_online_graph(
             "CREATE TABLE adjacency (update_row INTEGER NOT NULL, ref_col INTEGER NOT NULL, "
             "PRIMARY KEY(update_row, ref_col)) WITHOUT ROWID"
         )
-        for row, (left_id, right_id, similarity) in enumerate(qualifying_pairs()):
+        for row, (_left_pos, _right_pos, left_id, right_id, similarity) in enumerate(
+            item for item in scored_pairs("write virtual edges") if item[4] > virtual_edge_sigma
+        ):
             left_row, right_row = new_rows[left_id], new_rows[right_id]
             virtual_endpoints[row] = (left_row, right_row)
             virtual_similarities[row] = similarity
@@ -614,6 +798,9 @@ def build_streaming_online_graph(
             virtual_endpoints,
             virtual_similarities,
             virtual_features,
+            negative_endpoints,
+            negative_similarities,
+            negative_strengths,
             adjacency_cols,
             adjacency_values,
         ):
@@ -622,6 +809,8 @@ def build_streaming_online_graph(
 
         array_names = (
             "node_features.npy",
+            "sample_signal_features.npy",
+            "sample_signal_masks.npy",
             "radio_endpoints.npy",
             "radio_weights.npy",
             "radio_edge_features.npy",
@@ -629,11 +818,26 @@ def build_streaming_online_graph(
             "virtual_endpoints.npy",
             "virtual_similarities.npy",
             "virtual_edge_features.npy",
+            "negative_endpoints.npy",
+            "negative_similarities.npy",
+            "negative_strengths.npy",
             "update_reference_indptr.npy",
             "update_reference_cols.npy",
             "update_reference_values.npy",
         )
         arrays = tuple(_array_artifact(staging / name, name) for name in array_names)
+        sample_initializations = tuple(input_manifest.sample_location_initializations) + tuple(
+            SampleLocationInitialization(
+                scan_id=scan_id,
+                xy=update_pseudo_locations[scan_id],
+                source="seeded_pseudo_location",
+            )
+            for scan_id in update_sample_ids
+        )
+        sample_position_available = tuple(
+            bool(input_manifest.reference_label_mask[row])
+            for row in range(len(reference_sample_ids))
+        ) + (False,) * len(update_sample_ids)
         manifest_fields = dict(
             dataset_id=input_manifest.dataset_id,
             reference_batch_id=input_manifest.batch_id,
@@ -651,6 +855,7 @@ def build_streaming_online_graph(
             vocabulary_sha256=input_manifest.vocabulary_sha256,
             graph_build_config=input_manifest.graph_build_config,
             virtual_edge_sigma=virtual_edge_sigma,
+            similarity_feature_space=RSSI_SIMILARITY_SPACE,
             encoder_feature_dim=update_encoder_features.feature_dim,
             node_feature_dim=feature_dim,
             node_ids=node_ids,
@@ -660,10 +865,13 @@ def build_streaming_online_graph(
             ap_node_ids=ap_ids,
             node_types=("sample",) * len(sample_ids) + ("ap",) * len(ap_ids),
             node_feature_sources=tuple(node_sources),
+            sample_location_initializations=sample_initializations,
+            sample_position_available_mask=sample_position_available,
             labeled_reference_ids=labeled_ids,
             labeled_reference_coordinates=labeled_coordinates,
             radio_edge_count=radio_count,
             virtual_edge_count=virtual_count,
+            negative_pair_count=len(negative_pairs),
             adjacency_shape=(len(update_sample_ids), len(labeled_ids)),
             adjacency_nonzero_count=int(adjacency_counts.sum()),
             arrays=arrays,
@@ -721,6 +929,8 @@ def load_streaming_online_graph(
         directory=root,
         manifest=manifest,
         node_features=arrays["node_features.npy"],
+        sample_signal_features=arrays["sample_signal_features.npy"],
+        sample_signal_masks=arrays["sample_signal_masks.npy"],
         radio_endpoints=arrays["radio_endpoints.npy"],
         radio_weights=arrays["radio_weights.npy"],
         radio_edge_features=arrays["radio_edge_features.npy"],
@@ -728,6 +938,9 @@ def load_streaming_online_graph(
         virtual_endpoints=arrays["virtual_endpoints.npy"],
         virtual_similarities=arrays["virtual_similarities.npy"],
         virtual_edge_features=arrays["virtual_edge_features.npy"],
+        negative_endpoints=arrays["negative_endpoints.npy"],
+        negative_similarities=arrays["negative_similarities.npy"],
+        negative_strengths=arrays["negative_strengths.npy"],
         update_reference_indptr=arrays["update_reference_indptr.npy"],
         update_reference_cols=arrays["update_reference_cols.npy"],
         update_reference_values=arrays["update_reference_values.npy"],
@@ -834,6 +1047,29 @@ def save_streaming_online_lp_input(
         for start in range(0, n_nodes, 4096):
             node_features[start : start + 4096] = node_embeddings[start : start + 4096]
         _lp_finish_npy(node_features)
+        signal_features = _lp_open_npy(
+            staging / "sample_signal_features.npy",
+            np.dtype("float64"),
+            (n_samples, len(graph.manifest.bssid_vocabulary)),
+        )
+        signal_masks = _lp_open_npy(
+            staging / "sample_signal_masks.npy",
+            np.dtype("uint8"),
+            (n_samples, len(graph.manifest.bssid_vocabulary)),
+        )
+        if tuple(graph.sample_signal_features.shape) != tuple(signal_features.shape):
+            raise ValueError("online graph signal features do not align to sample IDs")
+        if tuple(graph.sample_signal_masks.shape) != tuple(signal_masks.shape):
+            raise ValueError("online graph RSSI masks do not align to sample IDs")
+        for start in range(0, n_samples, 4096):
+            signal_features[start : start + 4096] = graph.sample_signal_features[
+                start : start + 4096
+            ]
+            signal_masks[start : start + 4096] = graph.sample_signal_masks[
+                start : start + 4096
+            ]
+        _lp_finish_npy(signal_features)
+        _lp_finish_npy(signal_masks)
 
         radio_degree = np.zeros((n_nodes,), dtype=np.int64)
         for left, right in graph.radio_endpoints:
@@ -926,6 +1162,9 @@ def save_streaming_online_lp_input(
         )
         reference_ids = set(graph.manifest.reference_sample_ids)
         update_ids = set(graph.manifest.update_sample_ids)
+        online_initializations = {
+            item.scan_id: item for item in graph.manifest.sample_location_initializations
+        }
         for scan_id in sample_ids:
             is_reference = scan_id in reference_ids
             is_update = scan_id in update_ids
@@ -936,10 +1175,11 @@ def save_streaming_online_lp_input(
             if is_reference:
                 if reference_only:
                     coordinate = updated_label_map.get(scan_id)
-                    xy = tuple(
-                        float(value)
-                        for value in graph.node_features[node_row[scan_id], -2:]
-                    )
+                    original = bootstrap_positions.get(scan_id)
+                    if original is None:
+                        raise ValueError(f"reference location metadata is missing {scan_id}")
+                    original_initialization = original[0]
+                    xy = coordinate if coordinate is not None else original_initialization.xy
                     initializations.append(
                         SampleLocationInitialization(
                             scan_id=scan_id,
@@ -947,7 +1187,7 @@ def save_streaming_online_lp_input(
                             source=(
                                 "bootstrap_reference_label"
                                 if coordinate is not None
-                                else "seeded_pseudo_location"
+                                else original_initialization.source
                             ),
                         )
                     )
@@ -962,12 +1202,11 @@ def save_streaming_online_lp_input(
                     label_mask.append(bool(labeled))
                     coordinate_targets.append(coordinate)
             else:
-                xy = tuple(float(value) for value in graph.node_features[node_row[scan_id], -2:])
-                initializations.append(
-                    SampleLocationInitialization(
-                        scan_id=scan_id, xy=xy, source="seeded_pseudo_location"
-                    )
-                )
+                try:
+                    initialization = online_initializations[scan_id]
+                except KeyError as exc:
+                    raise ValueError(f"online location metadata is missing {scan_id}") from exc
+                initializations.append(initialization)
                 label_mask.append(False)
                 coordinate_targets.append(None)
         all_node_reference_mask = tuple(reference_mask + [False] * len(ap_ids))
@@ -993,6 +1232,8 @@ def save_streaming_online_lp_input(
             _lp_array_artifact(staging / name, name)
             for name in (
                 "node_features.npy",
+                "sample_signal_features.npy",
+                "sample_signal_masks.npy",
                 "radio_indptr.npy",
                 "radio_neighbor_rows.npy",
                 "radio_neighbor_weights.npy",
@@ -1043,6 +1284,7 @@ def save_streaming_online_lp_input(
             sample_node_ids=sample_ids,
             ap_node_ids=ap_ids,
             graph_build_config=graph.manifest.graph_build_config,
+            encoder_feature_dim=graph.manifest.encoder_feature_dim,
             sample_location_initializations=tuple(initializations),
             reference_sample_mask=all_node_reference_mask,
             new_sample_mask=all_node_update_mask,
@@ -1278,7 +1520,43 @@ def save_streaming_online_lp_input_with_new_aps(
                 ) / 2.0
             _lp_finish_npy(radio_features)
 
-            # Virtual topology is sample-only and remains unchanged by AP extension.
+            # Preserve measured normalized RSSI in the expanded AP order. New
+            # AP columns are zero/masked for old reference scans and populated
+            # from the complete incoming batch for update scans.
+            signal_features = _lp_open_npy(
+                staging / "sample_signal_features.npy",
+                np.dtype("float64"),
+                (sample_count, len(target_vocabulary)),
+            )
+            signal_masks = _lp_open_npy(
+                staging / "sample_signal_masks.npy",
+                np.dtype("uint8"),
+                (sample_count, len(target_vocabulary)),
+            )
+            old_signal_width = len(base_manifest.bssid_vocabulary)
+            signal_features[:, :old_signal_width] = base.sample_signal_features
+            signal_masks[:, :old_signal_width] = base.sample_signal_masks
+            if len(target_vocabulary) > old_signal_width:
+                signal_features[:, old_signal_width:] = 0.0
+                signal_masks[:, old_signal_width:] = 0
+            full_rows = full_update_prepared.ae_matrix()
+            full_masks = full_update_prepared.mask_matrix()
+            full_row_by_id = {
+                scan.scan_id: row for row, scan in enumerate(full_update_prepared.scans)
+            }
+            target_col = {bssid: col for col, bssid in enumerate(target_vocabulary)}
+            for scan_id in gm.update_sample_ids:
+                source_row = full_row_by_id[scan_id]
+                target_row = update_row_by_id[scan_id]
+                for source_col, bssid in enumerate(full_update_prepared.bssid_vocabulary):
+                    col = target_col[bssid]
+                    observed = bool(full_masks[source_row][source_col])
+                    signal_features[target_row, col] = (
+                        float(full_rows[source_row][source_col]) if observed else 0.0
+                    )
+                    signal_masks[target_row, col] = 1 if observed else 0
+            _lp_finish_npy(signal_features)
+            _lp_finish_npy(signal_masks)
             for name, array in (
                 ("virtual_indptr.npy", base.virtual_indptr),
                 ("virtual_neighbor_rows.npy", base.virtual_neighbor_rows),
@@ -1291,6 +1569,8 @@ def save_streaming_online_lp_input_with_new_aps(
                 _lp_array_artifact(staging / name, name)
                 for name in (
                     "node_features.npy",
+                    "sample_signal_features.npy",
+                    "sample_signal_masks.npy",
                     "radio_indptr.npy",
                     "radio_neighbor_rows.npy",
                     "radio_neighbor_weights.npy",
@@ -1329,17 +1609,12 @@ def save_streaming_online_lp_input_with_new_aps(
             label_mask = []
             coordinate_targets = []
             for scan_id in sample_ids:
-                if scan_id in reference_ids:
-                    init, label, coordinate = metadata_by_scan[scan_id]
-                elif scan_id in update_ids:
-                    init = SampleLocationInitialization(
-                        scan_id=scan_id,
-                        xy=tuple(float(value) for value in node_features[update_row_by_id[scan_id], -2:]),
-                        source="seeded_pseudo_location",
-                    )
-                    label, coordinate = False, None
-                else:
+                if scan_id not in reference_ids and scan_id not in update_ids:
                     raise ValueError(f"online sample has no role metadata: {scan_id}")
+                try:
+                    init, label, coordinate = metadata_by_scan[scan_id]
+                except KeyError as exc:
+                    raise ValueError(f"online sample location metadata is missing {scan_id}") from exc
                 initializations.append(init)
                 label_mask.append(bool(label))
                 coordinate_targets.append(coordinate)
@@ -1400,6 +1675,7 @@ def iter_streaming_ap_transition_candidates(
     full_update_prepared: PreparedDataset,
     extended_lp_manifest: StreamingLPInputManifest,
     sqlite_path: str | Path,
+    progress_callback: Callable[[str], None] | None = None,
 ):
     """Yield the AP-transition candidate rule from an ordered disk index.
 
@@ -1449,8 +1725,16 @@ def iter_streaming_ap_transition_candidates(
             mmap_mode="r",
             allow_pickle=False,
         )
+        if progress_callback is not None:
+            progress_callback(
+                "[link prediction] indexing AP-transition candidates from "
+                f"{len(base_endpoints):,} reference edges and "
+                f"{len(graph.virtual_endpoints):,} temporary virtual edges"
+            )
         insert_buffer: list[tuple[str, str]] = []
-        for sample_row, ap_row in base_endpoints:
+        endpoint_count = len(base_endpoints)
+        endpoint_progress_step = max(1, math.ceil(endpoint_count / 10))
+        for endpoint_index, (sample_row, ap_row) in enumerate(base_endpoints, start=1):
             sample_id = base.node_ids[int(sample_row)]
             ap_id = base.node_ids[int(ap_row)]
             if sample_id in reference_set and ap_id.startswith("ap:"):
@@ -1460,6 +1744,15 @@ def iter_streaming_ap_transition_candidates(
                         "INSERT OR IGNORE INTO candidates VALUES (?, ?)", insert_buffer
                     )
                     insert_buffer.clear()
+            if progress_callback is not None and (
+                endpoint_index == 1
+                or endpoint_index % endpoint_progress_step == 0
+                or endpoint_index == endpoint_count
+            ):
+                progress_callback(
+                    f"[link prediction] AP candidate index: reference edges "
+                    f"{endpoint_index:,}/{endpoint_count:,}"
+                )
         if insert_buffer:
             connection.executemany(
                 "INSERT OR IGNORE INTO candidates VALUES (?, ?)", insert_buffer
@@ -1486,7 +1779,9 @@ def iter_streaming_ap_transition_candidates(
         update_ids = set(gm.update_sample_ids)
         sample_row_to_id = gm.sample_node_ids
         new_candidate_buffer: list[tuple[str, str]] = []
-        for left, right in graph.virtual_endpoints:
+        virtual_count = len(graph.virtual_endpoints)
+        virtual_progress_step = max(1, math.ceil(virtual_count / 10))
+        for virtual_index, (left, right) in enumerate(graph.virtual_endpoints, start=1):
             left_id = sample_row_to_id[int(left)]
             right_id = sample_row_to_id[int(right)]
             if left_id in update_ids and right_id in reference_set:
@@ -1506,12 +1801,29 @@ def iter_streaming_ap_transition_candidates(
                             new_candidate_buffer,
                         )
                         new_candidate_buffer.clear()
+            if progress_callback is not None and (
+                virtual_index == 1
+                or virtual_index % virtual_progress_step == 0
+                or virtual_index == virtual_count
+            ):
+                progress_callback(
+                    f"[link prediction] AP candidate index: temporary virtual edges "
+                    f"{virtual_index:,}/{virtual_count:,}"
+                )
         if new_candidate_buffer:
             connection.executemany(
                 "INSERT OR IGNORE INTO candidates VALUES (?, ?)",
                 new_candidate_buffer,
             )
         connection.commit()
+        candidate_total = int(
+            connection.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+        )
+        if progress_callback is not None:
+            progress_callback(
+                f"[link prediction] AP candidate index ready: "
+                f"{candidate_total:,} unique sample/AP pairs"
+            )
         cursor = connection.execute(
             "SELECT sample_id, ap_id FROM candidates ORDER BY sample_id, ap_id"
         )
@@ -1532,6 +1844,7 @@ def infer_streaming_ap_graph_changes(
     candidate_index_path: str | Path,
     result_directory: str | Path,
     config: LinkPredictionConfig,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> StreamingAPInferenceState:
     """Run AP-transition Eq. (11)--(13) over streamed learned online state.
 
@@ -1543,6 +1856,10 @@ def infer_streaming_ap_graph_changes(
     input_path = Path(input_directory)
     candidate_path = Path(candidate_index_path)
     result_path = Path(result_directory)
+    if progress_callback is not None:
+        progress_callback(
+            "[link prediction] preparing AP-transition LP input from the updated graph"
+        )
     manifest = save_streaming_online_lp_input_with_new_aps(
         bootstrap_lp_input_directory,
         online_graph_directory,
@@ -1550,6 +1867,13 @@ def infer_streaming_ap_graph_changes(
         full_update_prepared=full_update_prepared,
         output_directory=input_path,
     )
+    if progress_callback is not None:
+        progress_callback(
+            f"[link prediction] AP-transition input ready: "
+            f"samples={len(manifest.sample_node_ids):,}, "
+            f"APs={len(manifest.ap_node_ids):,}, nodes={len(manifest.node_ids):,}, "
+            f"radio edges={manifest.radio_edge_count:,}"
+        )
     candidates = iter_streaming_ap_transition_candidates(
         bootstrap_lp_input_directory,
         bootstrap_lp_result_directory,
@@ -1557,12 +1881,14 @@ def infer_streaming_ap_graph_changes(
         full_update_prepared=full_update_prepared,
         extended_lp_manifest=manifest,
         sqlite_path=candidate_path,
+        progress_callback=progress_callback,
     )
     result = predict_edges_streaming(
         input_path,
         result_path,
         config,
         candidate_pairs=candidates,
+        progress_callback=progress_callback,
     )
     if result.manifest.candidate_policy != "explicit_sorted_stable_ids_v1":
         raise AssertionError("AP transition LP result lost its explicit candidate policy")
@@ -1669,8 +1995,27 @@ def build_streaming_reference_graph_after_transition(
         }
         if set(init_by_id) != set(sample_ids):
             raise ValueError("bootstrap graph lacks sample location initialization provenance")
+        resolved_build_config, spatial_transform = resolve_spatial_transform(
+            base.graph_build_config, base.dataset_id
+        )
+        if resolved_build_config != base.graph_build_config:
+            raise ValueError("post-transition graph spatial configuration is unresolved")
+        position_available_by_id = {
+            scan_id: bool(base.reference_label_mask[row])
+            for row, scan_id in enumerate(base.sample_node_ids)
+        }
         node_features = _open_array(
             staging / "node_features.npy", "float64", (len(node_ids), feature_dim)
+        )
+        sample_signal_features = _open_array(
+            staging / "sample_signal_features.npy",
+            "float64",
+            (sample_count, len(tm.vocabulary_after)),
+        )
+        sample_signal_masks = _open_array(
+            staging / "sample_signal_masks.npy",
+            "uint8",
+            (sample_count, len(tm.vocabulary_after)),
         )
         model = post_transition_ae_state.model.to(device=device, dtype=torch.float32).eval()
         with torch.inference_mode():
@@ -1689,8 +2034,41 @@ def build_streaming_reference_graph_after_transition(
                 latent = model.E(torch.tensor(inputs, dtype=torch.float32, device=device))[:, 0, :].cpu().numpy()
                 for offset, row in enumerate(rows):
                     scan_id = sample_ids[int(row)]
+                    measured_mask = tuple(bool(value) for value in masks[offset])
+                    normalized = raw_dbm_row_to_ae(
+                        raw[offset], measured_mask, tm.normalization
+                    )
+                    sample_signal_features[int(row)] = tuple(
+                        float(value) if observed else 0.0
+                        for value, observed in zip(normalized, measured_mask)
+                    )
+                    sample_signal_masks[int(row)] = measured_mask
                     node_features[int(row), :latent_dim] = latent[offset]
-                    node_features[int(row), latent_dim:] = init_by_id[scan_id].xy
+                    if spatial_transform is None:
+                        position_feature = init_by_id[scan_id].xy
+                    elif position_available_by_id[scan_id]:
+                        position_raw = init_by_id[scan_id].xy
+                        position_normalized = normalized_position_feature(
+                            spatial_transform,
+                            position_raw,
+                            available=True,
+                        )
+                        position_feature = tuple(
+                            float(value) * base.graph_build_config.position_weight
+                            for value in position_normalized
+                        )
+                    else:
+                        position_raw = init_by_id[scan_id].xy
+                        position_normalized = normalized_position_feature(
+                            spatial_transform,
+                            position_raw,
+                            available=False,
+                        )
+                        position_feature = tuple(
+                            float(value) * base.graph_build_config.position_weight
+                            for value in position_normalized
+                        )
+                    node_features[int(row), latent_dim:] = position_feature
 
         ap_feature_sums = np.zeros((len(ap_ids), feature_dim), dtype=np.float64)
         ap_weight_sums = np.zeros((len(ap_ids),), dtype=np.float64)
@@ -1711,6 +2089,10 @@ def build_streaming_reference_graph_after_transition(
             node_features[sample_count + row] = ap_feature_sums[row] / ap_weight_sums[row]
         if isinstance(node_features, np.memmap):
             node_features.flush()
+        if isinstance(sample_signal_features, np.memmap):
+            sample_signal_features.flush()
+        if isinstance(sample_signal_masks, np.memmap):
+            sample_signal_masks.flush()
 
         radio_endpoints = _open_array(staging / "radio_endpoints.npy", "int64", (radio_count, 2))
         radio_weights = _open_array(staging / "radio_weights.npy", "float64", (radio_count,))
@@ -1740,23 +2122,38 @@ def build_streaming_reference_graph_after_transition(
             "PRIMARY KEY(left_id,right_id)) WITHOUT ROWID"
         )
         lexical_rows = tuple(sorted(range(sample_count), key=sample_ids.__getitem__))
+        lexical_ids = tuple(sample_ids[row] for row in lexical_rows)
+        pair_sampler = BoundedNegativeSampler(
+            lexical_ids,
+            negative_similarity_threshold=base.graph_build_config.negative_similarity_threshold,
+            max_pairs_per_sample=base.graph_build_config.max_negative_pairs_per_sample,
+        )
         pending: list[tuple[str, str, float]] = []
         for left_pos, left_row in enumerate(lexical_rows):
             left_id = sample_ids[left_row]
-            left = node_features[left_row]
-            for right_row in lexical_rows[left_pos + 1 :]:
+            left = sample_signal_features[left_row]
+            for right_pos, right_row in enumerate(lexical_rows[left_pos + 1 :], start=left_pos + 1):
                 right_id = sample_ids[right_row]
-                similarity = _cosine(left, node_features[right_row])
+                similarity = normalized_rssi_cosine(
+                    left,
+                    sample_signal_features[right_row],
+                    sample_signal_masks[left_row],
+                    sample_signal_masks[right_row],
+                    minimum_shared_aps=base.graph_build_config.minimum_shared_aps,
+                )
                 if similarity is not None and similarity > base.graph_build_config.virtual_edge_sigma:
                     pending.append((left_id, right_id, similarity))
                     if len(pending) >= 8192:
                         virtual_db.executemany("INSERT INTO virtual_edges VALUES (?, ?, ?)", pending)
                         pending.clear()
+                elif similarity is not None and similarity <= base.graph_build_config.negative_similarity_threshold:
+                    pair_sampler.add(left_pos, right_pos, similarity)
         if pending:
             virtual_db.executemany("INSERT INTO virtual_edges VALUES (?, ?, ?)", pending)
         pending.clear()
         virtual_db.commit()
         virtual_count = int(virtual_db.execute("SELECT COUNT(*) FROM virtual_edges").fetchone()[0])
+        negative_pairs = pair_sampler.selected()
         virtual_endpoints = _open_array(
             staging / "virtual_endpoints.npy", "int64", (virtual_count, 2)
         )
@@ -1766,6 +2163,21 @@ def build_streaming_reference_graph_after_transition(
         virtual_edge_features = _open_array(
             staging / "virtual_edge_features.npy", "float64", (virtual_count, feature_dim)
         )
+        negative_endpoints = _open_array(
+            staging / "negative_endpoints.npy", "int64", (len(negative_pairs), 2)
+        )
+        negative_similarities = _open_array(
+            staging / "negative_similarities.npy", "float64", (len(negative_pairs),)
+        )
+        negative_strengths = _open_array(
+            staging / "negative_strengths.npy", "float64", (len(negative_pairs),)
+        )
+        for index, pair in enumerate(negative_pairs):
+            negative_endpoints[index] = (
+                sample_row[pair.left_sample_id], sample_row[pair.right_sample_id]
+            )
+            negative_similarities[index] = pair.signal_cosine_similarity
+            negative_strengths[index] = pair.negative_strength
         for index, (left_id, right_id, similarity) in enumerate(
             virtual_db.execute("SELECT left_id, right_id, similarity FROM virtual_edges ORDER BY left_id,right_id")
         ):
@@ -1777,7 +2189,14 @@ def build_streaming_reference_graph_after_transition(
             ) / 2.0
         virtual_db.close()
         (staging / "virtual_sort.sqlite3").unlink(missing_ok=True)
-        for array in (virtual_endpoints, virtual_similarities, virtual_edge_features):
+        for array in (
+            virtual_endpoints,
+            virtual_similarities,
+            virtual_edge_features,
+            negative_endpoints,
+            negative_similarities,
+            negative_strengths,
+        ):
             if isinstance(array, np.memmap):
                 array.flush()
 
@@ -1787,6 +2206,8 @@ def build_streaming_reference_graph_after_transition(
         np.save(staging / "update_reference_values.npy", np.empty((0,), dtype=np.float64), allow_pickle=False)
         names = (
             "node_features.npy",
+            "sample_signal_features.npy",
+            "sample_signal_masks.npy",
             "radio_endpoints.npy",
             "radio_weights.npy",
             "radio_edge_features.npy",
@@ -1794,6 +2215,9 @@ def build_streaming_reference_graph_after_transition(
             "virtual_endpoints.npy",
             "virtual_similarities.npy",
             "virtual_edge_features.npy",
+            "negative_endpoints.npy",
+            "negative_similarities.npy",
+            "negative_strengths.npy",
             "update_reference_indptr.npy",
             "update_reference_cols.npy",
             "update_reference_values.npy",
@@ -1848,6 +2272,7 @@ def build_streaming_reference_graph_after_transition(
             vocabulary_sha256=canonical_json_digest(tm.vocabulary_after),
             graph_build_config=base.graph_build_config,
             virtual_edge_sigma=base.graph_build_config.virtual_edge_sigma,
+            similarity_feature_space=RSSI_SIMILARITY_SPACE,
             encoder_feature_dim=latent_dim,
             node_feature_dim=feature_dim,
             node_ids=node_ids,
@@ -1858,10 +2283,15 @@ def build_streaming_reference_graph_after_transition(
             node_types=("sample",) * sample_count + ("ap",) * len(ap_ids),
             node_feature_sources=("post_transition_ae_reencoded_reference_sample",) * sample_count
             + ("post_transition_reference_ap_weighted_mean",) * len(ap_ids),
+            sample_location_initializations=tuple(init_by_id[scan_id] for scan_id in sample_ids),
+            sample_position_available_mask=tuple(
+                position_available_by_id[scan_id] for scan_id in sample_ids
+            ),
             labeled_reference_ids=label_ids,
             labeled_reference_coordinates=label_xy,
             radio_edge_count=radio_count,
             virtual_edge_count=virtual_count,
+            negative_pair_count=len(negative_pairs),
             adjacency_shape=(0, len(label_ids)),
             adjacency_nonzero_count=0,
             arrays=arrays,

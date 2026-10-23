@@ -520,7 +520,7 @@ def _load_pipeline_snapshot(
         raise ValueError("completed batch snapshot is missing its learned updater checkpoint")
     if updater_path is not None:
         updater_payload = load_torch_state(updater_path, map_location="cpu")
-        if updater_payload.get("format") != "gufu_fingerprint_update_checkpoint_v1":
+        if updater_payload.get("format") != "gufu_fingerprint_update_checkpoint_v4":
             raise ValueError("completed snapshot updater checkpoint has an unsupported format")
         updater_manifest = FingerprintUpdateManifest.model_validate_json(
             updater_payload["manifest_json"]
@@ -869,7 +869,8 @@ def _source_training_config(models: FingerprintUpdaterModels) -> GNNTrainingConf
         learning_rate=config.gnn_learning_rate,
         weight_decay=config.gnn_weight_decay,
         seed=config.seed,
-        objective_epsilon=config.equation4_epsilon,
+        contrastive_temperature=config.contrastive_temperature,
+        negative_weight=config.negative_weight,
     )
 
 

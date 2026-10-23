@@ -1,7 +1,7 @@
 """Paper-informed batch fingerprint updating for an unchanged AP vocabulary.
 
 This module owns the temporary reference+batch graph, the two update MLPs,
-the Eq. (4) GNN batch update, the Eq. (10) AE update, and a separate immutable
+the cosine-softplus GNN batch update, the Eq. (10) AE update, and a separate immutable
 fingerprint result. Update-coordinate truth is deliberately never read.
 """
 
@@ -21,7 +21,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor, nn
 
 from ae import AE, EncoderFeatureArtifact, load_ae_checkpoint
-from graph_build import GraphState, build_graph_state
+from graph_build import GraphBuildConfig, GraphState, build_graph_state
+from rssi_pairs import (
+    NegativeSamplePair,
+    RSSI_SIMILARITY_SPACE,
+    mine_rssi_pairs,
+    normalized_rssi_cosine,
+)
 from gufu_artifacts import (
     atomic_torch_save,
     atomic_write_json,
@@ -43,12 +49,13 @@ from sage_ve import (
     GNNFeatureArtifact,
     GraphTensorInput,
     LoadedGNNCheckpoint,
+    cosine_softplus_pair_losses,
     load_gnn_checkpoint,
 )
 from training_progress import DEFAULT_LOG_EVERY_K_EPOCHS, log_training_epoch, validate_log_interval
 
 
-UPDATE_CHECKPOINT_FORMAT = "gufu_fingerprint_update_checkpoint_v1"
+UPDATE_CHECKPOINT_FORMAT = "gufu_fingerprint_update_checkpoint_v4"
 UPDATE_ARTIFACT_FORMAT = "gufu_updated_fingerprints_v1"
 GRAPH_DIM = 34
 ENCODER_DIM = 32
@@ -62,7 +69,12 @@ class FingerprintUpdateConfig(BaseModel):
 
     hidden_dim: int = Field(default=64, ge=1)
     alpha: float = Field(default=0.5, ge=0.0, le=1.0)
-    virtual_edge_sigma: float = Field(default=0.95, ge=-1.0, le=1.0)
+    virtual_edge_sigma: float = Field(default=0.9, ge=-1.0, le=1.0)
+    negative_weight: float = Field(default=1.0, ge=0.0)
+    gnn_negative_objective: Literal[
+        "positive_negative_cosine_softplus_v1"
+    ] = "positive_negative_cosine_softplus_v1"
+    contrastive_temperature: float = Field(default=0.1, gt=0.0)
     adjacency_policy: Literal["row_normalized_cross_virtual_v1"] = (
         "row_normalized_cross_virtual_v1"
     )
@@ -77,7 +89,6 @@ class FingerprintUpdateConfig(BaseModel):
     ae_learning_rate: float = Field(default=0.001, gt=0.0)
     gnn_weight_decay: float = Field(default=0.0, ge=0.0)
     ae_weight_decay: float = Field(default=0.0, ge=0.0)
-    equation4_epsilon: float = Field(default=1.0e-12, gt=0.0)
     seed: int = 0
     optimizer: Literal["Adam"] = "Adam"
     loss_reduction: Literal["raw_frobenius_norms"] = "raw_frobenius_norms"
@@ -96,7 +107,8 @@ class FingerprintUpdateConfig(BaseModel):
             "ae_learning_rate",
             "gnn_weight_decay",
             "ae_weight_decay",
-            "equation4_epsilon",
+            "negative_weight",
+            "contrastive_temperature",
         ):
             if not math.isfinite(getattr(self, key)):
                 raise ValueError(f"{key} must be finite")
@@ -193,7 +205,7 @@ class OnlineUpdateGraph(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_online_update_graph_v1"] = "gufu_online_update_graph_v1"
+    format: Literal["gufu_online_update_graph_v4"] = "gufu_online_update_graph_v4"
     graph_id: str = Field(pattern=r"^onlinegraph:[0-9a-f]{64}$")
     reference_graph_id: str = Field(pattern=r"^graph:[0-9a-f]{64}$")
     current_reference_snapshot_id: str | None = None
@@ -202,6 +214,7 @@ class OnlineUpdateGraph(BaseModel):
     reference_batch_id: str
     update_batch_id: str
     normalization: NormalizationMode
+    graph_build_config: GraphBuildConfig
     encoder_feature_dim: int = Field(default=ENCODER_DIM, ge=1)
     node_feature_dim: int = Field(default=GRAPH_DIM, ge=3)
     bssid_vocabulary: tuple[str, ...]
@@ -222,26 +235,38 @@ class OnlineUpdateGraph(BaseModel):
         ], ...
     ]
     node_features: tuple[tuple[float, ...], ...]
+    # Measured normalized RSSI rows and masks in sample_node_ids order.
+    sample_signal_features: tuple[tuple[float, ...], ...]
+    sample_signal_masks: tuple[tuple[bool, ...], ...]
     labeled_reference_ids: tuple[str, ...]
     labeled_reference_coordinates: tuple[tuple[float, float], ...]
     reference_label_mask_by_sample: tuple[bool, ...]
     radio_edges: tuple[OnlineRadioEdge, ...]
     virtual_edges: tuple[OnlineVirtualEdge, ...]
+    negative_pairs: tuple[NegativeSamplePair, ...]
     temporary_sample_ids_removed_after_update: Literal[True] = True
     temporary_virtual_edges_removed_after_update: Literal[True] = True
     similarity_space: Literal[
-        "initial_augmented_z_encoder_plus_xy_34d",
-        "initial_augmented_z_encoder_plus_xy_v1",
-    ] = (
-        "initial_augmented_z_encoder_plus_xy_v1"
-    )
+        "normalized_rssi_cosine_min_overlap_v1"
+    ] = RSSI_SIMILARITY_SPACE
     virtual_edge_rule: Literal["strict_cosine_greater_than_sigma"] = (
         "strict_cosine_greater_than_sigma"
     )
     virtual_edge_sigma: float = Field(ge=-1.0, le=1.0)
+    negative_similarity_threshold: float = Field(gt=-1.0, le=1.0)
+    minimum_shared_aps: int = Field(ge=1)
+    max_negative_pairs_per_sample: int = Field(ge=1)
 
     @model_validator(mode="after")
     def valid_graph(self):
+        if self.graph_build_config.spatial_normalization_enabled:
+            metadata = self.graph_build_config.spatial_transform_metadata
+            if metadata is None or self.graph_build_config.spatial_transform_sha256 is None:
+                raise ValueError("online graph must record its fitted spatial transform")
+            if metadata.site_id != self.dataset_id:
+                raise ValueError("online graph spatial transform belongs to another site")
+        if self.negative_similarity_threshold >= self.virtual_edge_sigma:
+            raise ValueError("online negative similarity threshold must be below positive threshold")
         if self.node_ids != self.sample_node_ids + self.ap_node_ids:
             raise ValueError("online node rows must be samples followed by APs")
         if self.sample_node_ids != self.reference_sample_ids + self.update_sample_ids:
@@ -260,6 +285,28 @@ class OnlineUpdateGraph(BaseModel):
             self.node_feature_sources
         ) != len(self.node_ids):
             raise ValueError("online graph node metadata must align")
+        if len(self.sample_signal_features) != len(self.sample_node_ids) or len(
+            self.sample_signal_masks
+        ) != len(self.sample_node_ids) or any(
+            len(row) != len(self.bssid_vocabulary)
+            or any(not math.isfinite(value) for value in row)
+            for row in self.sample_signal_features
+        ):
+            raise ValueError(
+                "online normalized RSSI features must align to sample IDs and AP width"
+            )
+        if any(
+            len(row) != len(self.bssid_vocabulary)
+            for row in self.sample_signal_masks
+        ):
+            raise ValueError("online RSSI masks must align to sample IDs and AP width")
+        if any(
+            value != 0.0
+            for feature_row, mask_row in zip(self.sample_signal_features, self.sample_signal_masks)
+            for value, observed in zip(feature_row, mask_row)
+            if not observed
+        ):
+            raise ValueError("unobserved online RSSI columns must be zero")
         if self.node_feature_dim != self.encoder_feature_dim + COORD_DIM:
             raise ValueError("online graph feature width must be encoder width plus 2-D coordinates")
         if any(len(row) != self.node_feature_dim for row in self.node_features) or any(
@@ -291,6 +338,7 @@ class OnlineUpdateGraph(BaseModel):
         ):
             raise ValueError("online radio edges must have deterministic endpoint order")
         virtual_pairs = []
+        signal_row = {sample_id: row for row, sample_id in enumerate(self.sample_node_ids)}
         for edge in self.virtual_edges:
             if len(edge.feature) != self.node_feature_dim:
                 raise ValueError("online virtual edge feature width must match graph nodes")
@@ -298,11 +346,19 @@ class OnlineUpdateGraph(BaseModel):
                 raise ValueError("online virtual edge endpoints must be sample nodes")
             if edge.left_sample_id == edge.right_sample_id:
                 raise ValueError("online virtual graph cannot contain self-neighbors")
-            left = self.node_features[row_by_id[edge.left_sample_id]]
-            right = self.node_features[row_by_id[edge.right_sample_id]]
-            cosine = _cosine(left, right)
+            left = self.sample_signal_features[signal_row[edge.left_sample_id]]
+            right = self.sample_signal_features[signal_row[edge.right_sample_id]]
+            left_mask = self.sample_signal_masks[signal_row[edge.left_sample_id]]
+            right_mask = self.sample_signal_masks[signal_row[edge.right_sample_id]]
+            cosine = normalized_rssi_cosine(
+                left,
+                right,
+                left_mask,
+                right_mask,
+                minimum_shared_aps=self.minimum_shared_aps,
+            )
             if cosine is None or not math.isclose(cosine, edge.cosine_similarity, abs_tol=1e-12):
-                raise ValueError("online virtual similarity does not match its node inputs")
+                raise ValueError("online virtual similarity does not match normalized RSSI")
             if not cosine > self.virtual_edge_sigma:
                 raise ValueError("online virtual edge must pass the strict sigma threshold")
             virtual_pairs.append((edge.left_sample_id, edge.right_sample_id))
@@ -312,6 +368,27 @@ class OnlineUpdateGraph(BaseModel):
             sorted(self.virtual_edges, key=lambda edge: (edge.left_sample_id, edge.right_sample_id))
         ):
             raise ValueError("online virtual edges must have deterministic order")
+        expected_virtual, expected_negative = mine_rssi_pairs(
+            self.sample_node_ids,
+            self.sample_signal_features,
+            self.sample_signal_masks,
+            virtual_edge_sigma=self.virtual_edge_sigma,
+            negative_similarity_threshold=self.negative_similarity_threshold,
+            minimum_shared_aps=self.minimum_shared_aps,
+            max_negative_pairs_per_sample=self.max_negative_pairs_per_sample,
+        )
+        actual_virtual = tuple(
+            (edge.left_sample_id, edge.right_sample_id, edge.cosine_similarity)
+            for edge in self.virtual_edges
+        )
+        if len(expected_virtual) != len(actual_virtual) or any(
+            expected[:2] != actual[:2]
+            or not math.isclose(expected[2], actual[2], abs_tol=1e-12)
+            for expected, actual in zip(expected_virtual, actual_virtual)
+        ):
+            raise ValueError("online virtual edges do not match the RSSI mining policy")
+        if expected_negative != self.negative_pairs:
+            raise ValueError("online negative pairs do not match the RSSI mining policy")
         payload = _online_graph_payload(self)
         if self.graph_id != f"onlinegraph:{canonical_json_digest(payload)}":
             raise ValueError("online graph ID does not match its source state")
@@ -366,7 +443,7 @@ class UpdateEpochLoss(BaseModel):
 class FingerprintUpdateManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_fingerprint_update_checkpoint_v1"] = UPDATE_CHECKPOINT_FORMAT
+    format: Literal["gufu_fingerprint_update_checkpoint_v4"] = UPDATE_CHECKPOINT_FORMAT
     run_id: str
     config: FingerprintUpdateConfig
     dataset_id: str
@@ -787,6 +864,26 @@ def _make_online_graph(
         node_id: tuple(update_graph.node_features[update_rows[node_id]])
         for node_id in update_graph.node_ids
     }
+    signal_feature_by_id = {
+        scan_id: reference_graph.sample_rssi_features[row]
+        for row, scan_id in enumerate(reference_graph.sample_node_ids)
+    }
+    signal_feature_by_id.update(
+        {
+            scan_id: update_graph.sample_rssi_features[row]
+            for row, scan_id in enumerate(update_graph.sample_node_ids)
+        }
+    )
+    signal_mask_by_id = {
+        scan_id: reference_graph.sample_rssi_observation_masks[row]
+        for row, scan_id in enumerate(reference_graph.sample_node_ids)
+    }
+    signal_mask_by_id.update(
+        {
+            scan_id: update_graph.sample_rssi_observation_masks[row]
+            for row, scan_id in enumerate(update_graph.sample_node_ids)
+        }
+    )
     ap_vocab_order = reference_graph.ap_ids
     active_ap_ids = tuple(
         ap_id
@@ -831,22 +928,28 @@ def _make_online_graph(
         sorted(current_radio + update_radio, key=lambda edge: (edge.sample_node_id, edge.ap_node_id))
     )
 
+    ordered_signal_features = tuple(signal_feature_by_id[scan_id] for scan_id in sample_ids)
+    ordered_signal_masks = tuple(signal_mask_by_id[scan_id] for scan_id in sample_ids)
+    virtual_pairs, negative_pairs = mine_rssi_pairs(
+        sample_ids,
+        ordered_signal_features,
+        ordered_signal_masks,
+        virtual_edge_sigma=sigma,
+        negative_similarity_threshold=reference_graph.build_config.negative_similarity_threshold,
+        minimum_shared_aps=reference_graph.build_config.minimum_shared_aps,
+        max_negative_pairs_per_sample=reference_graph.build_config.max_negative_pairs_per_sample,
+    )
     virtual: list[OnlineVirtualEdge] = []
-    for left_index, left_id in enumerate(sample_ids):
-        for right_id in sample_ids[left_index + 1 :]:
-            similarity = _cosine(feature_by_id[left_id], feature_by_id[right_id])
-            if similarity is None or not similarity > sigma:
-                continue
-            a, b = sorted((left_id, right_id))
-            virtual.append(
-                OnlineVirtualEdge(
-                    edge_id=f"virtual:{a}|{b}",
-                    left_sample_id=a,
-                    right_sample_id=b,
-                    cosine_similarity=similarity,
-                    feature=_mean(feature_by_id[a], feature_by_id[b]),
-                )
+    for a, b, similarity in virtual_pairs:
+        virtual.append(
+            OnlineVirtualEdge(
+                edge_id=f"virtual:{a}|{b}",
+                left_sample_id=a,
+                right_sample_id=b,
+                cosine_similarity=similarity,
+                feature=_mean(feature_by_id[a], feature_by_id[b]),
             )
+        )
     virtual_edges = tuple(sorted(virtual, key=lambda edge: (edge.left_sample_id, edge.right_sample_id)))
 
     label_by_id = {
@@ -866,6 +969,7 @@ def _make_online_graph(
         reference_batch_id=reference_graph.batch_id,
         update_batch_id=update_graph.batch_id,
         normalization=reference_graph.normalization,
+        graph_build_config=reference_graph.build_config,
         encoder_feature_dim=reference_graph.encoder_feature_dim,
         node_feature_dim=reference_graph.node_feature_dim,
         bssid_vocabulary=reference_graph.bssid_vocabulary,
@@ -879,13 +983,21 @@ def _make_online_graph(
         ap_node_ids=active_ap_ids,
         node_feature_sources=tuple(source_by_id[node_id] for node_id in node_ids),
         node_features=tuple(feature_by_id[node_id] for node_id in node_ids),
-        similarity_space="initial_augmented_z_encoder_plus_xy_v1",
+        sample_signal_features=tuple(
+            signal_feature_by_id[scan_id] for scan_id in sample_ids
+        ),
+        sample_signal_masks=tuple(signal_mask_by_id[scan_id] for scan_id in sample_ids),
+        similarity_space=RSSI_SIMILARITY_SPACE,
         labeled_reference_ids=labeled_ids,
         labeled_reference_coordinates=coordinates,
         reference_label_mask_by_sample=tuple(label_by_id[node_id] is not None for node_id in reference_graph.sample_node_ids),
         radio_edges=radio_edges,
         virtual_edges=virtual_edges,
+        negative_pairs=negative_pairs,
         virtual_edge_sigma=sigma,
+        negative_similarity_threshold=reference_graph.build_config.negative_similarity_threshold,
+        minimum_shared_aps=reference_graph.build_config.minimum_shared_aps,
+        max_negative_pairs_per_sample=reference_graph.build_config.max_negative_pairs_per_sample,
     )
     provisional = OnlineUpdateGraph.model_construct(
         graph_id="onlinegraph:" + "0" * 64,
@@ -916,6 +1028,18 @@ def _online_graph_tensors(graph: OnlineUpdateGraph) -> GraphTensorInput:
         edge_ids=edge_ids,
         radio_edge_ids=tuple(edge.edge_id for edge in graph.radio_edges),
         virtual_edge_ids=tuple(edge.edge_id for edge in graph.virtual_edges),
+        negative_left_rows=torch.tensor(
+            [row_by_id[pair.left_sample_id] for pair in graph.negative_pairs],
+            dtype=torch.long,
+        ),
+        negative_right_rows=torch.tensor(
+            [row_by_id[pair.right_sample_id] for pair in graph.negative_pairs],
+            dtype=torch.long,
+        ),
+        negative_pair_strengths=torch.tensor(
+            [pair.negative_strength for pair in graph.negative_pairs],
+            dtype=torch.float32,
+        ),
     )
 
 
@@ -988,6 +1112,8 @@ def prepare_fingerprint_update(
         raise ValueError("reference and update RSS normalization differ")
     if reference_graph.bssid_vocabulary != reference_prepared.bssid_vocabulary:
         raise ValueError("reference graph AP vocabulary does not match prepared data")
+    if selected.virtual_edge_sigma != reference_graph.build_config.virtual_edge_sigma:
+        raise ValueError("online virtual-edge threshold must match the reference graph config")
 
     ref_ids = tuple(scan.scan_id for scan in reference_prepared.scans)
     update_ids = tuple(scan.scan_id for scan in update_prepared.scans)
@@ -1050,7 +1176,7 @@ def prepare_fingerprint_update(
     )
     tensors = _online_graph_tensors(online_graph)
     if not online_graph.radio_edges and not online_graph.virtual_edges:
-        raise ValueError("online GNN Eq. (4) requires at least one graph edge")
+        raise ValueError("online GNN cosine objective requires at least one positive pair")
 
     coords_by_id = _coordinates_for_ids(reference_prepared, ref_ids)
     labeled_ids = tuple(
@@ -1194,17 +1320,42 @@ def compute_update_losses(
     return losses, predicted_update_xy, predicted_reference_z
 
 
-def equation4_online_loss(node_embeddings: Tensor, graph: GraphTensorInput, *, epsilon: float) -> Tensor:
-    """Same Eq. (4) as ``sage_ve``, applied to the transient combined graph."""
+def equation4_online_loss(
+    node_embeddings: Tensor,
+    graph: GraphTensorInput,
+    *,
+    temperature: float = 0.1,
+    negative_weight: float = 1.0,
+    epsilon: float | None = None,
+) -> Tensor:
+    """Mean softplus cosine loss over online positive and negative pairs."""
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("contrastive temperature must be finite and positive")
+    if not math.isfinite(negative_weight) or negative_weight < 0.0:
+        raise ValueError("negative_weight must be finite and nonnegative")
     if node_embeddings.shape != (len(graph.node_ids), graph.node_features.shape[1]):
-        raise ValueError("online Eq. (4) expects [nodes,online_graph.node_feature_dim]")
+        raise ValueError("online cosine loss expects [nodes,online_graph.node_feature_dim]")
     if not graph.edge_ids:
-        raise ValueError("online Eq. (4) cannot train a graph with no edges")
-    dots = (
-        node_embeddings[graph.edge_left_rows]
-        * node_embeddings[graph.edge_right_rows]
-    ).sum(dim=1)
-    return -torch.log(torch.relu(dots).clamp_min(epsilon)).sum()
+        raise ValueError("online cosine loss requires at least one positive pair")
+    if (
+        graph.negative_left_rows is None
+        or graph.negative_right_rows is None
+        or graph.negative_left_rows.numel() == 0
+    ):
+        raise ValueError("online cosine loss requires at least one mined negative pair")
+    positive_pairs = torch.stack(
+        (graph.edge_left_rows, graph.edge_right_rows)
+    ).to(node_embeddings.device)
+    negative_pairs = torch.stack(
+        (graph.negative_left_rows, graph.negative_right_rows)
+    ).to(node_embeddings.device)
+    positive_loss, negative_loss = cosine_softplus_pair_losses(
+        node_embeddings,
+        positive_pairs,
+        negative_pairs,
+        temperature=temperature,
+    )
+    return positive_loss + negative_weight * negative_loss
 
 
 def compute_ae_update_losses(model: AE, rss_input: Tensor, updated_latent_target: Tensor) -> dict[str, Tensor]:
@@ -1273,6 +1424,18 @@ def _train_online_gnn(
         edge_ids=graph.edge_ids,
         radio_edge_ids=graph.radio_edge_ids,
         virtual_edge_ids=graph.virtual_edge_ids,
+        negative_left_rows=(
+            graph.negative_left_rows.to(device)
+            if graph.negative_left_rows is not None else None
+        ),
+        negative_right_rows=(
+            graph.negative_right_rows.to(device)
+            if graph.negative_right_rows is not None else None
+        ),
+        negative_pair_strengths=(
+            graph.negative_pair_strengths.to(device)
+            if graph.negative_pair_strengths is not None else None
+        ),
     )
     optimizer = torch.optim.Adam(
         model.parameters(), lr=config.gnn_learning_rate, weight_decay=config.gnn_weight_decay
@@ -1285,14 +1448,17 @@ def _train_online_gnn(
             optimizer.zero_grad(set_to_none=True)
             output = model(graph)
             loss = equation4_online_loss(
-                output.node_features, graph, epsilon=config.equation4_epsilon
+                output.node_features,
+                graph,
+                temperature=config.contrastive_temperature,
+                negative_weight=config.negative_weight,
             )
             if not torch.isfinite(loss).item():
-                raise FloatingPointError("online GNN Eq. (4) loss is non-finite")
+                raise FloatingPointError("online GNN cosine loss is non-finite")
             loss.backward()
             grads = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
             if not grads or not any(torch.count_nonzero(grad).item() for grad in grads):
-                raise RuntimeError("online GNN Eq. (4) produced no parameter gradient")
+                raise RuntimeError("online GNN cosine loss produced no parameter gradient")
             if any(not torch.isfinite(grad).all().item() for grad in grads):
                 raise FloatingPointError("online GNN gradient is non-finite")
             optimizer.step()
@@ -1306,6 +1472,10 @@ def _train_online_gnn(
                     "nodes": len(graph.node_ids),
                     "radio_edges": graph.radio_edge_count,
                     "virtual_edges": len(graph.virtual_edge_ids),
+                    "negative_pairs": (
+                        0 if graph.negative_left_rows is None
+                        else int(graph.negative_left_rows.numel())
+                    ),
                     "learning_rate": optimizer.param_groups[0]["lr"],
                 },
                 every_k_epochs=log_every_epochs,

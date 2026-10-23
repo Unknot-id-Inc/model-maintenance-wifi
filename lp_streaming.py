@@ -18,9 +18,10 @@ import json
 import math
 import os
 import tempfile
-from collections.abc import Iterable as IterableABC
+from collections.abc import Callable, Iterable as IterableABC
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Iterator, Literal
 
 import numpy as np
@@ -37,7 +38,7 @@ from lp import (
 from sage_ve import GNNFeatureArtifact
 
 
-STREAM_INPUT_FORMAT = "gufu_lp_stream_input_v1"
+STREAM_INPUT_FORMAT = "gufu_lp_stream_input_v3"
 STREAM_RESULT_FORMAT = "gufu_lp_stream_result_v1"
 
 
@@ -64,7 +65,7 @@ class StreamingLPInputManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_lp_stream_input_v1"] = STREAM_INPUT_FORMAT
+    format: Literal["gufu_lp_stream_input_v3"] = STREAM_INPUT_FORMAT
     input_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     graph_id: str = Field(pattern=r"^graph:[0-9a-f]{64}$")
     dataset_id: str
@@ -83,6 +84,7 @@ class StreamingLPInputManifest(BaseModel):
     sample_node_ids: tuple[str, ...]
     ap_node_ids: tuple[str, ...]
     graph_build_config: GraphBuildConfig
+    encoder_feature_dim: int = Field(ge=1)
     sample_location_initializations: tuple[SampleLocationInitialization, ...]
     reference_sample_mask: tuple[bool, ...]
     new_sample_mask: tuple[bool, ...]
@@ -105,8 +107,19 @@ class StreamingLPInputManifest(BaseModel):
             "ap",
         ) * len(self.ap_node_ids):
             raise ValueError("streaming LP node types do not match node order")
+        if self.node_feature_dim != self.encoder_feature_dim + 2:
+            raise ValueError("streaming LP graph width must equal encoder width plus XY")
+        if self.graph_build_config.spatial_normalization_enabled:
+            metadata = self.graph_build_config.spatial_transform_metadata
+            if metadata is None or self.graph_build_config.spatial_transform_sha256 is None:
+                raise ValueError("streaming LP input must record its fitted spatial transform")
+            if metadata.site_id != self.dataset_id:
+                raise ValueError("streaming LP spatial transform belongs to another site")
         if len(self.sample_location_initializations) != len(self.sample_node_ids):
             raise ValueError("streaming LP input must retain sample location provenance")
+        for row, initialization in enumerate(self.sample_location_initializations):
+            if self.reference_label_mask[row] and initialization.source != "bootstrap_reference_label":
+                raise ValueError("available LP input positions need bootstrap label provenance")
         if any(
             len(values) != len(self.node_ids)
             for values in (
@@ -126,6 +139,14 @@ class StreamingLPInputManifest(BaseModel):
             raise ValueError("streaming LP input array index is incomplete or duplicated")
         expected_shapes = {
             "node_features.npy": (len(self.node_ids), self.node_feature_dim),
+            "sample_signal_features.npy": (
+                len(self.sample_node_ids),
+                len(self.bssid_vocabulary),
+            ),
+            "sample_signal_masks.npy": (
+                len(self.sample_node_ids),
+                len(self.bssid_vocabulary),
+            ),
             "radio_indptr.npy": (len(self.node_ids) + 1,),
             "radio_neighbor_rows.npy": (2 * self.radio_edge_count,),
             "radio_neighbor_weights.npy": (2 * self.radio_edge_count,),
@@ -326,6 +347,8 @@ class StreamingLPResult:
 class _MappedInput:
     manifest: StreamingLPInputManifest
     node_features: np.ndarray
+    sample_signal_features: np.ndarray
+    sample_signal_masks: np.ndarray
     radio_indptr: np.ndarray
     radio_neighbor_rows: np.ndarray
     radio_neighbor_weights: np.ndarray
@@ -338,6 +361,8 @@ class _MappedInput:
 
 _INPUT_ARRAY_NAMES = (
     "node_features.npy",
+    "sample_signal_features.npy",
+    "sample_signal_masks.npy",
     "radio_indptr.npy",
     "radio_neighbor_rows.npy",
     "radio_neighbor_weights.npy",
@@ -508,6 +533,21 @@ def save_streaming_lp_input(
     for row, values in enumerate(learned.node_feature_matrix):
         node_features[row, :] = values
     _finish_npy(node_features)
+    sample_signal_features = _open_npy(
+        staging / "sample_signal_features.npy",
+        np.dtype("float64"),
+        (sample_count, len(graph.bssid_vocabulary)),
+    )
+    sample_signal_masks = _open_npy(
+        staging / "sample_signal_masks.npy",
+        np.dtype("uint8"),
+        (sample_count, len(graph.bssid_vocabulary)),
+    )
+    for row in range(sample_count):
+        sample_signal_features[row, :] = graph.sample_rssi_features[row]
+        sample_signal_masks[row, :] = graph.sample_rssi_observation_masks[row]
+    _finish_npy(sample_signal_features)
+    _finish_npy(sample_signal_masks)
 
     radio_counts = np.zeros((node_count,), dtype=np.int64)
     for edge in graph.radio_edges:
@@ -617,6 +657,7 @@ def save_streaming_lp_input(
         "reference_coordinate_targets": graph.reference_coordinate_targets,
         "omitted_unobserved_ap_ids": graph.omitted_unobserved_ap_ids,
         "node_feature_dim": feature_dim,
+        "encoder_feature_dim": graph.encoder_feature_dim,
         "radio_edge_count": radio_count,
         "virtual_edge_count": virtual_count,
         "radio_weight_max": max(
@@ -659,6 +700,8 @@ def load_streaming_lp_input(
     mapped = _MappedInput(
         manifest=manifest,
         node_features=arrays["node_features.npy"],
+        sample_signal_features=arrays["sample_signal_features.npy"],
+        sample_signal_masks=arrays["sample_signal_masks.npy"],
         radio_indptr=arrays["radio_indptr.npy"],
         radio_neighbor_rows=arrays["radio_neighbor_rows.npy"],
         radio_neighbor_weights=arrays["radio_neighbor_weights.npy"],
@@ -699,6 +742,17 @@ def validate_streaming_lp_input(
     for row, values in enumerate(learned.node_feature_matrix):
         if not np.array_equal(mapped.node_features[row], np.asarray(values, dtype=np.float64)):
             raise ValueError(f"streaming LP node feature row changed for {graph.node_ids[row]}")
+    for row in range(len(graph.sample_node_ids)):
+        expected = np.asarray(graph.sample_rssi_features[row], dtype=np.float64)
+        if not np.array_equal(mapped.sample_signal_features[row], expected):
+            raise ValueError(
+                f"streaming LP normalized RSSI row changed for {graph.sample_node_ids[row]}"
+            )
+        expected_mask = np.asarray(graph.sample_rssi_observation_masks[row], dtype=np.uint8)
+        if not np.array_equal(mapped.sample_signal_masks[row], expected_mask):
+            raise ValueError(
+                f"streaming LP RSSI mask row changed for {graph.sample_node_ids[row]}"
+            )
     for row, values in enumerate(learned.radio_edge_feature_matrix):
         if not np.array_equal(
             mapped.radio_edge_features[row], np.asarray(values, dtype=np.float64)
@@ -764,10 +818,17 @@ def _finite_array_row(row: np.ndarray) -> bool:
     return all(math.isfinite(float(value)) for value in row)
 
 
+def _report_progress(callback: Callable[[str], None] | None, message: str) -> None:
+    if callback is not None:
+        callback(f"[link prediction] {message}")
+
+
 def _run_goodness_fairness(
     mapped: _MappedInput,
     config: LinkPredictionConfig,
     work_directory: Path,
+    *,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[Path, Path, int, float, float, bool]:
     goodness, fairness, goodness_next, fairness_next = _initial_feature_files(
         work_directory, mapped.node_features
@@ -779,6 +840,15 @@ def _run_goodness_fairness(
     iterations = 0
     g_residual = f_residual = 0.0
     converged = no_edges
+    started_at = monotonic()
+    last_progress_at = started_at
+    progress_iteration_step = max(1, math.ceil(config.max_iterations / 10))
+    _report_progress(
+        progress_callback,
+        f"goodness/fairness solver started: nodes={node_count:,}, "
+        f"features={feature_dim}, max_iterations={config.max_iterations:,}, "
+        f"tolerance={config.convergence_epsilon:g}",
+    )
     while not converged and iterations < config.max_iterations:
         for row in range(node_count):
             start = int(mapped.radio_indptr[row])
@@ -853,6 +923,27 @@ def _run_goodness_fairness(
         converged = (
             g_residual <= config.convergence_epsilon
             or f_residual <= config.convergence_epsilon
+        )
+        now = monotonic()
+        if (
+            iterations % progress_iteration_step == 0
+            or now - last_progress_at >= 10.0
+            or converged
+            or iterations == config.max_iterations
+        ):
+            _report_progress(
+                progress_callback,
+                f"goodness/fairness iteration {iterations:,}/"
+                f"{config.max_iterations:,}; residuals="
+                f"({g_residual:.6g}, {f_residual:.6g}); "
+                f"elapsed={now - started_at:.1f}s"
+                + ("; converged" if converged else ""),
+            )
+            last_progress_at = now
+    if no_edges:
+        _report_progress(
+            progress_callback,
+            "goodness/fairness solver skipped because the graph has no edges",
         )
     return (
         Path(goodness.filename),
@@ -1231,6 +1322,7 @@ def predict_edges_streaming(
     *,
     candidate_pairs: IterableABC[tuple[str, str]] | None = None,
     verify_input_hashes: bool = True,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> StreamingLPResult:
     """Run the same LP equations using memory-mapped compact graph state.
 
@@ -1241,16 +1333,32 @@ def predict_edges_streaming(
     """
     selected = config or LinkPredictionConfig()
     target = Path(output_directory)
+    started_at = monotonic()
     staging = _create_staging_directory(target)
     try:
+        _report_progress(progress_callback, "validating and mapping LP input artifacts")
         input_manifest, mapped = load_streaming_lp_input(
             input_directory, verify_hashes=verify_input_hashes
+        )
+        _report_progress(
+            progress_callback,
+            f"input ready: samples={len(input_manifest.sample_node_ids):,}, "
+            f"APs={len(input_manifest.ap_node_ids):,}, "
+            f"nodes={len(input_manifest.node_ids):,}, "
+            f"radio edges={input_manifest.radio_edge_count:,}, "
+            f"virtual edges={input_manifest.virtual_edge_count:,}",
         )
         if input_manifest.radio_weight_max < 0.0:
             raise ValueError("streaming LP input has an invalid radio weight maximum")
 
+        _report_progress(progress_callback, "starting goodness/fairness propagation")
         goodness_path, fairness_path, iterations, g_residual, f_residual, converged = (
-            _run_goodness_fairness(mapped, selected, staging)
+            _run_goodness_fairness(
+                mapped,
+                selected,
+                staging,
+                progress_callback=progress_callback,
+            )
         )
         candidate_path = staging / "candidate_scores.jsonl"
         added_path = staging / "added_edges.jsonl"
@@ -1281,6 +1389,13 @@ def predict_edges_streaming(
             termination = "residual_tolerance"
             goodness = np.load(goodness_path, mmap_mode="r", allow_pickle=False)
             fairness = np.load(fairness_path, mmap_mode="r", allow_pickle=False)
+            scoring_started_at = monotonic()
+            last_scoring_progress_at = scoring_started_at
+            last_scoring_progress_count = 0
+            _report_progress(
+                progress_callback,
+                "starting candidate-edge scoring and delta serialization",
+            )
             with (
                 candidate_path.open("w", encoding="utf-8", newline="\n") as candidate_file,
                 added_path.open("w", encoding="utf-8", newline="\n") as added_file,
@@ -1344,6 +1459,33 @@ def predict_edges_streaming(
                         )
                         _write_jsonl_record(removed_file, change)
                         removed_count += 1
+                    if progress_callback is not None and (
+                        candidate_count == 1 or candidate_count % 1024 == 0
+                    ):
+                        now = monotonic()
+                        if (
+                            candidate_count == 1
+                            or candidate_count - last_scoring_progress_count >= 5000
+                            or now - last_scoring_progress_at >= 10.0
+                        ):
+                            _report_progress(
+                                progress_callback,
+                                f"scored {candidate_count:,} candidate edges; "
+                                f"added={added_count:,}, removed={removed_count:,}; "
+                                f"elapsed={now - scoring_started_at:.1f}s",
+                            )
+                            last_scoring_progress_at = now
+                            last_scoring_progress_count = candidate_count
+            _report_progress(
+                progress_callback,
+                f"candidate scoring complete: {candidate_count:,} scored, "
+                f"added={added_count:,}, removed={removed_count:,}; "
+                f"elapsed={monotonic() - scoring_started_at:.1f}s",
+            )
+            _report_progress(
+                progress_callback,
+                "writing updated graph arrays and final LP artifacts",
+            )
             updated_edge_count, ap_removals, active_aps = _write_updated_edge_arrays(
                 mapped,
                 staging,
@@ -1459,6 +1601,13 @@ def predict_edges_streaming(
         atomic_write_json(result_manifest, staging / "manifest.json")
         _write_completion(staging, "manifest.json", result_id)
         _publish_directory(staging, target)
+        _report_progress(
+            progress_callback,
+            f"complete: outcome={result_manifest.outcome}, "
+            f"iterations={result_manifest.iterations:,}, "
+            f"candidates={result_manifest.candidate_count:,}, "
+            f"elapsed={monotonic() - started_at:.1f}s; output={target}",
+        )
         return StreamingLPResult(target, result_manifest)
     except Exception:
         # Failed staging directories have no completion marker and cannot be

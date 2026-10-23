@@ -128,15 +128,15 @@ def test_shuffled_encoder_rows_join_by_scan_id_and_graph_rows_are_not_encoder_ro
     assert first != "0" and second != "1"
 
 
-def test_virtual_edges_use_strict_augmented_cosine_and_omit_zero_norm_pairs(tmp_path):
+def test_virtual_edges_use_signal_only_cosine_and_omit_zero_norm_pairs(tmp_path):
     prepared = prepare(
         tmp_path,
         "cosine.txt",
         [
             "0,0 001122334455,-60",
-            "0,0 001122334455,-60",
-            "0,0 001122334455,-60",
-            "0,0 001122334455,-60",
+            "100,-100 001122334455,-60",
+            "200,0 001122334455,-60",
+            "0,200 001122334455,-60",
         ],
     )
     ids = tuple(scan.scan_id for scan in prepared.scans)
@@ -157,6 +157,11 @@ def test_virtual_edges_use_strict_augmented_cosine_and_omit_zero_norm_pairs(tmp_
     edge = graph.virtual_edges[0]
     assert (edge.sample_node_id_left, edge.sample_node_id_right) == tuple(sorted(ids[:2]))
     assert edge.cosine_similarity == pytest.approx(1.0)
+    rows = graph.id_to_row
+    assert graph.node_features[rows[ids[0]]][32:] == pytest.approx((0.0, 0.0))
+    assert graph.node_features[rows[ids[1]]][32:] == pytest.approx((100.0, -100.0))
+    assert edge.edge_feature[32:] == pytest.approx((50.0, -50.0))
+    assert graph.build_config.similarity_feature_space == "z_encoder_signal_only_v1"
     assert edge.scalar_weight is None
     assert edge.temporary is True
     assert all(edge.sample_node_id_left != edge.sample_node_id_right for edge in graph.virtual_edges)
@@ -167,6 +172,11 @@ def test_virtual_edges_use_strict_augmented_cosine_and_omit_zero_norm_pairs(tmp_
         GraphBuildConfig(virtual_edge_sigma=1.0),
     )
     assert exact_boundary.virtual_edges == ()  # 1.0 is not strictly greater than sigma=1.0
+
+
+def test_old_augmented_similarity_config_is_rejected():
+    with pytest.raises(ValidationError):
+        GraphBuildConfig(similarity_feature_space="z_graph_input_augmented")
 
 
 def test_update_samples_get_seeded_pseudo_xy_without_reading_eval_truth(tmp_path):

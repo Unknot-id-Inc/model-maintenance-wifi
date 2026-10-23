@@ -1,7 +1,8 @@
 """Chunked full-graph GNN training and inference over the streamed online graph.
 
-The implementation preserves the local Eq. (4) sum objective and Algorithm 1
-forward equations. Numeric graph state and per-epoch activations live in NumPy
+The implementation applies mean softplus losses to normalized cosine scores
+for positive graph edges and RSSI-mined negative scan pairs, matching the
+in-memory trainer. Numeric graph state and per-epoch activations live in NumPy
 memory maps; only one edge/node chunk and the small model are resident at once.
 Dropout uses the explicitly named, deterministic chunk RNG policy recorded in
 the checkpoint because chunked RNG calls cannot promise PyTorch's full-tensor
@@ -34,6 +35,7 @@ from gufu_artifacts import (
     sha256_file,
 )
 from lp_streaming import StreamArrayArtifact
+from graph_build import GraphBuildConfig
 from sage_ve import (
     EdgeFeatureSAGE,
     GNNModelConfig,
@@ -44,14 +46,14 @@ from streaming_update import MappedStreamingOnlineGraph, load_streaming_online_g
 from training_progress import DEFAULT_LOG_EVERY_K_EPOCHS, log_training_epoch, validate_log_interval
 
 
-STREAM_GNN_FORMAT = "gufu_streaming_gnn_v1"
-STREAM_GNN_TRAINING_POLICY = "chunked_full_graph_eq4_sum_explicit_dropout_v1"
+STREAM_GNN_FORMAT = "gufu_streaming_gnn_v6"
+STREAM_GNN_TRAINING_POLICY = "chunked_full_graph_softplus_cosine_rssi_pairs_explicit_dropout_spatial_v6"
 
 
 class StreamingGNNManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_gnn_v1"] = STREAM_GNN_FORMAT
+    format: Literal["gufu_streaming_gnn_v6"] = STREAM_GNN_FORMAT
     artifact_id: str = Field(pattern=r"^streamgnn:[0-9a-f]{64}$")
     online_graph_id: str = Field(pattern=r"^onlinegraph:[0-9a-f]{64}$")
     dataset_id: str
@@ -60,14 +62,16 @@ class StreamingGNNManifest(BaseModel):
     reference_graph_id: str = Field(pattern=r"^graph:[0-9a-f]{64}$")
     reference_lp_result_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_gnn_checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    graph_build_config: GraphBuildConfig
     vocabulary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     node_ids: tuple[str, ...]
     radio_edge_count: int = Field(ge=0)
     virtual_edge_count: int = Field(ge=0)
+    negative_pair_count: int = Field(ge=0)
     model_config_record: GNNModelConfig
     training_config: GNNTrainingConfig
     training_policy: Literal[
-        "chunked_full_graph_eq4_sum_explicit_dropout_v1"
+        "chunked_full_graph_softplus_cosine_rssi_pairs_explicit_dropout_spatial_v6"
     ] = STREAM_GNN_TRAINING_POLICY
     dropout_rng_policy: Literal["per_epoch_layer_kind_chunk_sequence_v1"] = (
         "per_epoch_layer_kind_chunk_sequence_v1"
@@ -91,6 +95,11 @@ class StreamingGNNManifest(BaseModel):
             raise ValueError("streaming GNN loss history must be finite")
         if self.model_config_record.graph_feature_dim < 1:
             raise ValueError("streaming GNN feature width must be positive")
+        if self.graph_build_config.spatial_normalization_enabled and (
+            self.graph_build_config.spatial_transform_metadata is None
+            or self.graph_build_config.spatial_transform_sha256 is None
+        ):
+            raise ValueError("streaming GNN checkpoint must carry resolved spatial transform metadata")
         expected = {
             "node_embeddings.npy": (len(self.node_ids), self.model_config_record.node_output_dim),
             "radio_edge_features.npy": (
@@ -313,7 +322,9 @@ def _forward_stream(
             ).astype(np.float32)[:, None]
             aggregate_features = _tensor(mean_aggregate, device)
             node_inputs = torch.cat((self_features, aggregate_features), dim=1)
-            node_values = F.relu(F.linear(node_inputs, parameters[layer * 3 + 1]))
+            node_values = F.leaky_relu(
+                F.linear(node_inputs, parameters[layer * 3 + 1]), negative_slope=0.1
+            )
             mask = _dropout_mask(
                 stop - start, dim, model_config.dropout_probability,
                 node_generator, device,
@@ -339,7 +350,9 @@ def _forward_stream(
             old_edge = _tensor(e_current[start:stop], device)
             right = _tensor(h_next[endpoints[:, 1]], device)
             edge_inputs = torch.cat((left, old_edge, right), dim=1)
-            edge_values = F.relu(F.linear(edge_inputs, parameters[layer * 3 + 2]))
+            edge_values = F.leaky_relu(
+                F.linear(edge_inputs, parameters[layer * 3 + 2]), negative_slope=0.1
+            )
             mask = _dropout_mask(
                 stop - start, dim, model_config.dropout_probability,
                 edge_generator, device,
@@ -362,30 +375,58 @@ def _loss_and_node_gradient(
     final_node_path: Path,
     work_directory: Path,
     *,
-    epsilon: float,
     chunk_size: int,
     device: torch.device,
+    temperature: float = 0.1,
+    negative_weight: float = 1.0,
+    epsilon: float | None = None,
 ):
     count_nodes = len(graph.manifest.node_ids)
     count_edges = graph.manifest.radio_edge_count + graph.manifest.virtual_edge_count
+    count_negatives = graph.manifest.negative_pair_count
+    if count_edges == 0:
+        raise ValueError("cosine softplus loss requires at least one positive pair")
+    if count_negatives == 0:
+        raise ValueError("cosine softplus loss requires at least one negative pair")
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("contrastive temperature must be finite and positive")
+    if not math.isfinite(negative_weight) or negative_weight < 0.0:
+        raise ValueError("negative_weight must be finite and nonnegative")
     final_nodes = np.load(final_node_path, mmap_mode="r", allow_pickle=False)
     gradient = _open_array(work_directory / "gradient_h_final.npy", (count_nodes, graph.manifest.node_feature_dim))
     gradient[:] = 0.0
     loss_value = 0.0
+
+    def accumulate_pair_loss(endpoints: np.ndarray, *, positive: bool, pair_count: int):
+        nonlocal loss_value
+        if len(endpoints) == 0:
+            return
+        with torch.enable_grad():
+            left = _tensor(final_nodes[endpoints[:, 0]], device).requires_grad_(True)
+            right = _tensor(final_nodes[endpoints[:, 1]], device).requires_grad_(True)
+            left_normalized = F.normalize(left, p=2, dim=-1)
+            right_normalized = F.normalize(right, p=2, dim=-1)
+            cosines = (left_normalized * right_normalized).sum(dim=-1)
+            if positive:
+                pair_loss = F.softplus(-cosines / temperature)
+                coefficient = 1.0 / float(pair_count)
+            else:
+                pair_loss = F.softplus(cosines / temperature)
+                coefficient = negative_weight / float(pair_count)
+            scaled_loss = pair_loss.sum() * coefficient
+            grad_left, grad_right = torch.autograd.grad(scaled_loss, (left, right))
+        loss_value += float(scaled_loss.detach().cpu())
+        np.add.at(gradient, endpoints[:, 0], grad_left.detach().cpu().numpy())
+        np.add.at(gradient, endpoints[:, 1], grad_right.detach().cpu().numpy())
+
     for start in range(0, count_edges, chunk_size):
         stop = min(start + chunk_size, count_edges)
         endpoints = _edge_endpoints(graph, start, stop)
-        left = _tensor(final_nodes[endpoints[:, 0]], device)
-        right = _tensor(final_nodes[endpoints[:, 1]], device)
-        dots = (left * right).sum(dim=1)
-        clamped = torch.relu(dots).clamp_min(epsilon)
-        loss_value += float((-torch.log(clamped).sum()).detach().cpu())
-        valid = dots > epsilon
-        inverse = torch.where(valid, dots.reciprocal(), torch.zeros_like(dots))
-        grad_left = -right * inverse[:, None]
-        grad_right = -left * inverse[:, None]
-        np.add.at(gradient, endpoints[:, 0], grad_left.detach().cpu().numpy())
-        np.add.at(gradient, endpoints[:, 1], grad_right.detach().cpu().numpy())
+        accumulate_pair_loss(endpoints, positive=True, pair_count=count_edges)
+    for start in range(0, count_negatives, chunk_size):
+        stop = min(start + chunk_size, count_negatives)
+        endpoints = np.asarray(graph.negative_endpoints[start:stop], dtype=np.int64)
+        accumulate_pair_loss(endpoints, positive=False, pair_count=count_negatives)
     if isinstance(gradient, np.memmap):
         gradient.flush()
     return loss_value, work_directory / "gradient_h_final.npy"
@@ -449,7 +490,7 @@ def _backward_stream(
                 old_edge = _tensor(e_input[start:stop], device, requires_grad=True)
                 right = _tensor(h_output[endpoints[:, 1]], device, requires_grad=True)
                 inputs = torch.cat((left, old_edge, right), dim=1).requires_grad_(True)
-                values = F.relu(F.linear(inputs, weight))
+                values = F.leaky_relu(F.linear(inputs, weight), negative_slope=0.1)
                 mask = _dropout_mask(
                     stop - start, dim, model_config.dropout_probability,
                     edge_generator, device,
@@ -475,7 +516,7 @@ def _backward_stream(
         if isinstance(grad_h_combined, np.memmap):
             grad_h_combined.flush()
 
-        # Node update derivative: h' = normalize(dropout(relu([h,a] W1))).
+        # Node update derivative matches EdgeFeatureSAGE's leaky-ReLU update.
         aggregate = np.load(aggregate_paths[layer], mmap_mode="r", allow_pickle=False)
         grad_h_input_path = work_directory / f"gradient_h_input_{layer}.npy"
         grad_h_input = _open_array(grad_h_input_path, (count_nodes, dim))
@@ -492,7 +533,7 @@ def _backward_stream(
             ).astype(np.float32)[:, None]
             aggregate_features = _tensor(mean_aggregate, device)
             inputs = torch.cat((self_features, aggregate_features), dim=1).requires_grad_(True)
-            values = F.relu(F.linear(inputs, weight))
+            values = F.leaky_relu(F.linear(inputs, weight), negative_slope=0.1)
             mask = _dropout_mask(
                 stop - start, dim, model_config.dropout_probability,
                 node_generator, device,
@@ -572,9 +613,34 @@ def _backward_stream(
 
 class _StreamedEquation4(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, graph, model_config, epsilon, seed, chunk_size, *parameters):
+    def forward(
+        ctx,
+        graph,
+        model_config,
+        epsilon,
+        seed,
+        chunk_size,
+        *objective_and_parameters,
+    ):
+        parameter_count = 3 * model_config.num_layers
+        optional_input_count = len(objective_and_parameters) - parameter_count
+        if optional_input_count not in (0, 2):
+            raise ValueError("streamed contrastive loss received invalid objective arguments")
+        if optional_input_count == 0:
+            temperature = 0.1
+            negative_weight = 1.0
+            parameters = objective_and_parameters
+        else:
+            temperature, negative_weight = objective_and_parameters[:2]
+            parameters = objective_and_parameters[2:]
+        if len(parameters) != parameter_count:
+            raise ValueError("streamed contrastive model parameter count is inconsistent")
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("contrastive temperature must be finite and positive")
+        if not math.isfinite(negative_weight) or negative_weight < 0.0:
+            raise ValueError("negative_weight must be finite and nonnegative")
         if graph.manifest.radio_edge_count + graph.manifest.virtual_edge_count == 0:
-            raise ValueError("streamed Eq. (4) requires at least one physical or virtual edge")
+            raise ValueError("streamed contrastive loss requires positive pairs")
         work_directory = Path(tempfile.mkdtemp(prefix="gufu-stream-gnn-"))
         try:
             h_paths, e_paths, aggregate_paths, degree = _forward_stream(
@@ -588,18 +654,21 @@ class _StreamedEquation4(torch.autograd.Function):
             )
             # Distinguish epochs by deriving the seed before entry. The caller
             # passes a unique per-epoch seed; epoch zero is then fixed here.
-            loss_value, grad_path = _loss_and_node_gradient(
+            loss_result = _loss_and_node_gradient(
                 graph,
                 h_paths[-1],
                 work_directory,
-                epsilon=epsilon,
                 chunk_size=chunk_size,
                 device=parameters[0].device,
+                temperature=temperature,
+                negative_weight=negative_weight,
             )
+            loss_value, grad_path = loss_result
             ctx.graph = graph
             ctx.model_config = model_config
             ctx.seed = seed
             ctx.chunk_size = chunk_size
+            ctx.optional_input_count = optional_input_count
             ctx.work_directory = work_directory
             ctx.h_paths = h_paths
             ctx.e_paths = e_paths
@@ -619,7 +688,7 @@ class _StreamedEquation4(torch.autograd.Function):
         parameters = ctx.saved_tensors
         try:
             with torch.enable_grad():
-                gradients = _backward_stream(
+                gradients = list(_backward_stream(
                     ctx.graph,
                     ctx.model_config,
                     tuple(parameters),
@@ -633,13 +702,14 @@ class _StreamedEquation4(torch.autograd.Function):
                     seed=ctx.seed,
                     epoch=0,
                     device=parameters[0].device,
-                )
+                ))
             return (
                 None,
                 None,
                 None,
                 None,
                 None,
+                *(None for _ in range(ctx.optional_input_count)),
                 *(gradient * grad_output if gradient is not None else None for gradient in gradients),
             )
         finally:
@@ -734,16 +804,18 @@ def train_streaming_gnn(
             training_config.objective_epsilon,
             training_config.seed + epoch * 65537,
             chunk_size,
+            training_config.contrastive_temperature,
+            training_config.negative_weight,
             *parameters,
         )
         if not torch.isfinite(loss).item():
-            raise FloatingPointError("streamed Eq. (4) loss is non-finite")
+            raise FloatingPointError("streamed contrastive loss is non-finite")
         loss.backward()
         grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
         if not grads or any(not torch.isfinite(gradient).all().item() for gradient in grads):
             raise FloatingPointError("streamed GNN gradients are missing or non-finite")
         if not any(torch.count_nonzero(gradient).item() for gradient in grads):
-            raise RuntimeError("streamed Eq. (4) produced no parameter gradient")
+            raise RuntimeError("streamed contrastive loss produced no parameter gradient")
         optimizer.step()
         scalar_loss = float(loss.detach().cpu())
         history.append(scalar_loss)
@@ -756,6 +828,7 @@ def train_streaming_gnn(
                 "nodes": len(graph.manifest.node_ids),
                 "radio_edges": graph.manifest.radio_edge_count,
                 "virtual_edges": graph.manifest.virtual_edge_count,
+                "negative_pairs": graph.manifest.negative_pair_count,
                 "chunk_size": chunk_size,
                 "learning_rate": optimizer.param_groups[0]["lr"],
             },
@@ -804,10 +877,12 @@ def train_streaming_gnn(
             ),
             reference_lp_result_id=graph.manifest.reference_lp_result_id,
             source_gnn_checkpoint_sha256=source_checkpoint_sha256,
+            graph_build_config=graph.manifest.graph_build_config,
             vocabulary_sha256=graph.manifest.vocabulary_sha256,
             node_ids=graph.manifest.node_ids,
             radio_edge_count=graph.manifest.radio_edge_count,
             virtual_edge_count=graph.manifest.virtual_edge_count,
+            negative_pair_count=graph.manifest.negative_pair_count,
             model_config_record=config,
             training_config=training_config,
             epochs_completed=len(history),
@@ -862,6 +937,8 @@ def load_streaming_gnn_state(
         or manifest.vocabulary_sha256 != graph.manifest.vocabulary_sha256
         or manifest.dataset_id != graph.manifest.dataset_id
         or manifest.update_batch_id != graph.manifest.update_batch_id
+        or manifest.negative_pair_count != graph.manifest.negative_pair_count
+        or manifest.graph_build_config != graph.manifest.graph_build_config
     ):
         raise ValueError("streaming GNN checkpoint is incompatible with online graph identity/order")
     checkpoint_path = root / manifest.checkpoint_name

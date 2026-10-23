@@ -12,7 +12,7 @@ import torch
 from ae import AETrainingConfig
 from batch_transition import TransitionConfig
 from fingerprint_update import FingerprintUpdateConfig
-from graph_build import GraphBuildConfig
+from graph_build import GraphBuildConfig, resolve_spatial_transform
 from gufu_artifacts import atomic_write_json
 from gufu_data import PreprocessingConfig
 from lp import LinkPredictionConfig
@@ -72,14 +72,21 @@ if DATA_PROFILE == "real_dataset":
         loss=AE_LOSS,
     )
     GNN_TRAINING_CONFIG = GNNTrainingConfig(
-        epochs=50, learning_rate=0.01, weight_decay=0.0, seed=SEED
+        epochs=50,
+        learning_rate=0.01,
+        weight_decay=0.0,
+        seed=SEED,
+        contrastive_temperature=0.1,
+        negative_weight=1.0,
     )
     LINK_CONFIG = LinkPredictionConfig(
         max_iterations=2000, convergence_epsilon=1e-3, link_threshold=0.1
     )
     UPDATE_CONFIG = FingerprintUpdateConfig(
         alpha=0.5,
-        virtual_edge_sigma=0.95,
+        virtual_edge_sigma=0.9,
+        contrastive_temperature=0.1,
+        negative_weight=1.0,
         gnn_epochs=1,
         updater_epochs=100,
         ae_epochs=5,
@@ -109,7 +116,12 @@ elif DATA_PROFILE == "cpu_smoke":
         loss=AE_LOSS,
     )
     GNN_TRAINING_CONFIG = GNNTrainingConfig(
-        epochs=1, learning_rate=0.001, weight_decay=0.0, seed=SEED
+        epochs=1,
+        learning_rate=0.001,
+        weight_decay=0.0,
+        seed=SEED,
+        contrastive_temperature=0.1,
+        negative_weight=1.0,
     )
     LINK_CONFIG = LinkPredictionConfig(
         max_iterations=8, convergence_epsilon=1e9, link_threshold=0.0
@@ -117,9 +129,9 @@ elif DATA_PROFILE == "cpu_smoke":
     UPDATE_CONFIG = FingerprintUpdateConfig(
         hidden_dim=16,
         alpha=0.5,
-        # Smoke mode uses real scans and radio edges while strict cosine > 1.0
-        # omits temporary virtual pairs to bound graph memory.
-        virtual_edge_sigma=1.0,
+        virtual_edge_sigma=0.9,
+        contrastive_temperature=0.1,
+        negative_weight=1.0,
         gnn_epochs=1,
         updater_epochs=1,
         ae_epochs=1,
@@ -158,10 +170,10 @@ if DEVICE == "cpu":
 # Stable run IDs make cell re-execution reuse the same validated artifacts.
 # Change this string deliberately to create a separate run and train fresh models.
 RUN_ID = (
-    f"cpu-smoke-real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-"
+    f"cpu-smoke-real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v1-softplus-cosine-t0p1-nw1-"
     f"d{AE_DENSE_WIDTH}-z{AE_LATENT_DIM}-drop{str(AE_DROPOUT_PROBABILITY).replace('.', 'p')}"
     if DATA_PROFILE == "cpu_smoke"
-    else f"real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-"
+    else f"real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v1-softplus-cosine-t0p1-nw1-"
     f"d{AE_DENSE_WIDTH}-z{AE_LATENT_DIM}-drop{str(AE_DROPOUT_PROBABILITY).replace('.', 'p')}"
 )
 RUN_DIR = Path("output") / "notebook_runs" / DATASET_ID / RUN_ID
@@ -202,9 +214,17 @@ PREPROCESSING_CONFIG = PreprocessingConfig(
 )
 GRAPH_CONFIG = GraphBuildConfig(
     virtual_edge_strategy="paper_cosine_threshold",
-    virtual_edge_sigma=(1.0 if DATA_PROFILE == "cpu_smoke" else 0.95),
+    virtual_edge_sigma=0.9,
+    similarity_feature_space="normalized_rssi_cosine_min_overlap_v1",
+    negative_similarity_threshold=0.5,
+    minimum_shared_aps=3,
+    max_negative_pairs_per_sample=8,
     pseudo_location_seed=SEED,
+    spatial_normalization_enabled=True,
+    spatial_transform_path=str(Path("artifacts") / "spatial" / f"{DATASET_ID}.json"),
+    position_weight=1.0,
 )
+GRAPH_CONFIG, _SPATIAL_TRANSFORM = resolve_spatial_transform(GRAPH_CONFIG, DATASET_ID)
 GNN_MODEL_CONFIG = GNNModelConfig(
     graph_feature_dim=AE_LATENT_DIM + 2,
     edge_feature_dim=AE_LATENT_DIM + 2,
@@ -634,6 +654,11 @@ from lp_streaming import (
     validate_streaming_lp_input,
 )
 
+
+def _report_pipeline_progress(message):
+    print(message, flush=True)
+
+
 streaming_lp_result = None
 if RUN_MODE == "full":
     print(
@@ -672,10 +697,16 @@ else:
         flush=True,
     )
     if STREAMING_LP_INPUT_DIR.exists():
+        _report_pipeline_progress(
+            "[link prediction] validating the saved streaming input bundle"
+        )
         input_manifest = validate_streaming_lp_input(
             graph_state, gnn_features, STREAMING_LP_INPUT_DIR
         )
     else:
+        _report_pipeline_progress(
+            "[link prediction] creating the streaming input bundle"
+        )
         input_manifest = save_streaming_lp_input(
             graph_state, gnn_features, STREAMING_LP_INPUT_DIR
         )
@@ -683,6 +714,9 @@ else:
     assert input_manifest.gnn_checkpoint_sha256 == gnn_features.checkpoint_sha256
     assert input_manifest.vocabulary_sha256 == graph_state.vocabulary_sha256
     if STREAMING_LP_RESULT_DIR.exists():
+        _report_pipeline_progress(
+            "[link prediction] validating the saved proposal; the solver will be skipped if it matches"
+        )
         streaming_lp_result = load_streaming_lp_result(
             STREAMING_LP_RESULT_DIR,
             input_directory=STREAMING_LP_INPUT_DIR,
@@ -693,10 +727,14 @@ else:
                 "configuration; change RUN_ID for a new result"
             )
     else:
+        _report_pipeline_progress(
+            "[link prediction] no saved proposal found; starting a new run"
+        )
         streaming_lp_result = predict_edges_streaming(
             STREAMING_LP_INPUT_DIR,
             STREAMING_LP_RESULT_DIR,
             LINK_CONFIG,
+            progress_callback=_report_pipeline_progress,
         )
     lp_manifest = streaming_lp_result.manifest
     assert lp_manifest.parent_graph_id == graph_state.graph_id
@@ -782,6 +820,7 @@ if RUN_MODE == "lp_streaming":
             bootstrap_paths=BOOTSTRAP_PATHS,
             update_paths=(first_update_path,),
             source_root=INPUT_ROOT,
+            progress_callback=_report_pipeline_progress,
         )
         print(
             f"First streamed batch={first_update_path}; "
@@ -914,6 +953,7 @@ if RUN_MODE == "lp_streaming":
         bootstrap_paths=BOOTSTRAP_PATHS,
         update_paths=selected_streaming_update_paths,
         source_root=INPUT_ROOT,
+        progress_callback=_report_pipeline_progress,
     )
     latest = pipeline_result.latest_snapshot
     latest_directory = pipeline_result.latest_snapshot_directory

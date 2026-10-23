@@ -97,7 +97,16 @@ def _bootstrap(tmp_path):
 
     gnn_features = load_gnn_features(tmp_path / "gnn-features.json")
     lp_input_dir = tmp_path / "bootstrap-lp-input"
-    save_streaming_lp_input(graph, gnn_features, lp_input_dir)
+    lp_manifest = save_streaming_lp_input(graph, gnn_features, lp_input_dir)
+    loaded_manifest, mapped_input = load_streaming_lp_input(lp_input_dir)
+    assert loaded_manifest.input_id == lp_manifest.input_id
+    assert loaded_manifest.encoder_feature_dim == graph.encoder_feature_dim
+    np.testing.assert_array_equal(
+        mapped_input.sample_signal_features,
+        np.asarray(graph.node_features)[
+            : len(graph.sample_node_ids), : graph.encoder_feature_dim
+        ],
+    )
     link = LinkPredictionConfig(
         max_iterations=2, convergence_epsilon=1e9, link_threshold=0.0
     )

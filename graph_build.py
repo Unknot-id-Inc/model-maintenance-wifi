@@ -1,8 +1,11 @@
 """Deterministic, provenance-bound graph construction for GUFU Sec. 4.2.
 
 This module creates the graph input state only. It does not train a GNN or
-silently synthesize encoder features. Paper virtual-edge selection uses strict
-cosine-thresholding; a top-k mode exists only as an explicitly named alternative.
+silently synthesize encoder features. Virtual relations and bounded negative
+pairs use cosine similarity over measured, normalized RSSI rows in fixed AP
+order, with a minimum shared-AP requirement. Full graph vectors still use
+encoder features and location for AP/GNN/updater consumers. A top-k virtual-edge
+mode exists only as an explicitly named alternative.
 """
 
 from __future__ import annotations
@@ -23,10 +26,24 @@ from gufu_data import (
     canonicalize_bssid,
     rssi_dbm_to_graph_weight,
 )
+from rssi_pairs import (
+    NegativeSamplePair,
+    RSSI_SIMILARITY_SPACE,
+    mine_rssi_pairs,
+    normalized_rssi_cosine,
+)
+from spatial_normalization import (
+    FittedSpatialTransform,
+    SpatialTransformMetadata,
+    load_spatial_transform,
+    normalized_position_feature,
+)
 
 
-GRAPH_BUILDER_VERSION = "gufu_graph_builder_v1"
+GRAPH_BUILDER_VERSION = "gufu_graph_builder_v4"
 GRAPH_FEATURE_SPACE = "z_encoder_concat_location_input"
+NORMALIZED_GRAPH_FEATURE_SPACE = "z_encoder_concat_normalized_location_input"
+SIMILARITY_FEATURE_SPACE = RSSI_SIMILARITY_SPACE
 
 
 class GraphConstructionError(ValueError):
@@ -41,11 +58,18 @@ class GraphBuildConfig(BaseModel):
     virtual_edge_strategy: Literal[
         "paper_cosine_threshold", "top_k_alternative"
     ] = "paper_cosine_threshold"
-    virtual_edge_sigma: float = Field(default=0.95, ge=-1.0, le=1.0)
+    virtual_edge_sigma: float = Field(default=0.9, ge=-1.0, le=1.0)
     top_k: int | None = Field(default=None, ge=1)
+    negative_similarity_threshold: float = Field(default=0.5, gt=-1.0, le=1.0)
+    minimum_shared_aps: int = Field(default=3, ge=1)
+    max_negative_pairs_per_sample: int = Field(default=8, ge=1)
+    # Pair mining uses the measured, normalized RSSI vector in fixed AP order.
+    # Encoder and location features remain the GNN's node representation.
     similarity_feature_space: Literal[
-        "z_graph_input_augmented"
-    ] = "z_graph_input_augmented"
+        "normalized_rssi_cosine_min_overlap_v1"
+    ] = (
+        SIMILARITY_FEATURE_SPACE
+    )
     radio_weight_policy: Literal["observed_rssi_dbm_plus_120"] = (
         "observed_rssi_dbm_plus_120"
     )
@@ -63,6 +87,11 @@ class GraphBuildConfig(BaseModel):
     )
     pseudo_location_seed: int = 0
     pseudo_location_bounds: tuple[float, float, float, float] | None = None
+    spatial_normalization_enabled: bool = False
+    spatial_transform_path: str | None = None
+    spatial_transform_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    spatial_transform_metadata: SpatialTransformMetadata | None = None
+    position_weight: float = Field(default=1.0, ge=0.0)
     zero_norm_similarity_policy: Literal["omit_virtual_pair"] = "omit_virtual_pair"
     zero_weight_ap_policy: Literal["error"] = "error"
     isolated_vocabulary_ap_policy: Literal["omit_and_record"] = "omit_and_record"
@@ -73,12 +102,40 @@ class GraphBuildConfig(BaseModel):
             raise ValueError("top_k is only valid with virtual_edge_strategy='top_k_alternative'")
         if self.virtual_edge_strategy == "top_k_alternative" and self.top_k is None:
             raise ValueError("top_k_alternative requires an explicit positive top_k")
+        if self.negative_similarity_threshold >= self.virtual_edge_sigma:
+            raise ValueError(
+                "negative_similarity_threshold must be below virtual_edge_sigma"
+            )
         if self.pseudo_location_bounds is not None:
             if not all(math.isfinite(value) for value in self.pseudo_location_bounds):
                 raise ValueError("pseudo-location bounds must be finite")
             min_x, max_x, min_y, max_y = self.pseudo_location_bounds
             if min_x > max_x or min_y > max_y:
                 raise ValueError("pseudo-location bounds must be ordered min/max pairs")
+        if not math.isfinite(self.position_weight):
+            raise ValueError("position_weight must be finite")
+        if self.spatial_normalization_enabled:
+            if not self.spatial_transform_path:
+                raise ValueError(
+                    "spatial normalization requires a saved spatial_transform_path"
+                )
+            if self.spatial_transform_metadata is not None:
+                if self.spatial_transform_sha256 is None:
+                    raise ValueError("spatial transform metadata requires its SHA-256 identity")
+                if canonical_json_digest(
+                    self.spatial_transform_metadata.model_dump(mode="json")
+                ) != self.spatial_transform_sha256:
+                    raise ValueError("spatial transform metadata and SHA-256 identity disagree")
+        elif any(
+            value is not None
+            for value in (
+                self.spatial_transform_sha256,
+                self.spatial_transform_metadata,
+            )
+        ):
+            raise ValueError("disabled spatial normalization cannot carry fitted transform metadata")
+        elif self.position_weight != 1.0:
+            raise ValueError("position_weight is only configurable when spatial normalization is enabled")
         return self
 
 
@@ -155,11 +212,12 @@ class GraphState(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    schema_version: Literal[1] = 1
-    builder_version: Literal["gufu_graph_builder_v1"] = GRAPH_BUILDER_VERSION
+    schema_version: Literal[4] = 4
+    builder_version: Literal["gufu_graph_builder_v4"] = GRAPH_BUILDER_VERSION
     graph_id: str = Field(pattern=r"^graph:[0-9a-f]{64}$")
     graph_feature_space: Literal[
-        "z_encoder_concat_location_input"
+        "z_encoder_concat_location_input",
+        "z_encoder_concat_normalized_location_input",
     ] = GRAPH_FEATURE_SPACE
     dataset_id: str
     batch_id: str
@@ -182,6 +240,8 @@ class GraphState(BaseModel):
     ap_node_ids: tuple[str, ...]
     omitted_unobserved_ap_ids: tuple[str, ...]
     node_features: tuple[tuple[float, ...], ...]
+    sample_rssi_features: tuple[tuple[float, ...], ...]
+    sample_rssi_observation_masks: tuple[tuple[bool, ...], ...]
     reference_sample_mask: tuple[bool, ...]
     new_sample_mask: tuple[bool, ...]
     reference_label_mask: tuple[bool, ...]
@@ -189,6 +249,7 @@ class GraphState(BaseModel):
     sample_location_initializations: tuple[SampleLocationInitialization, ...]
     radio_edges: tuple[RadioGraphEdge, ...]
     virtual_edges: tuple[VirtualGraphEdge, ...]
+    negative_pairs: tuple[NegativeSamplePair, ...]
     virtual_edges_are_temporary: Literal[True] = True
 
     @model_validator(mode="after")
@@ -204,10 +265,50 @@ class GraphState(BaseModel):
             raise ValueError("node types/features must align with node IDs")
         if self.node_feature_dim != self.encoder_feature_dim + self.coordinate_feature_dim:
             raise ValueError("graph feature width must equal encoder width plus coordinate width")
+        expected_feature_space = (
+            NORMALIZED_GRAPH_FEATURE_SPACE
+            if self.build_config.spatial_normalization_enabled
+            else GRAPH_FEATURE_SPACE
+        )
+        if self.graph_feature_space != expected_feature_space:
+            raise ValueError("graph feature space disagrees with spatial normalization configuration")
+        if self.build_config.spatial_normalization_enabled:
+            metadata = self.build_config.spatial_transform_metadata
+            if metadata is None or self.build_config.spatial_transform_sha256 is None:
+                raise ValueError("normalized graph must record its fitted spatial transform")
+            if metadata.site_id != self.dataset_id:
+                raise ValueError("graph spatial transform belongs to a different site")
         if any(len(row) != self.node_feature_dim for row in self.node_features):
             raise ValueError("node feature matrix must match its declared feature width")
         if any(not math.isfinite(value) for row in self.node_features for value in row):
             raise ValueError("node features must be finite")
+        if len(self.sample_rssi_features) != len(self.sample_node_ids) or len(
+            self.sample_rssi_observation_masks
+        ) != len(self.sample_node_ids):
+            raise ValueError("sample RSSI rows and masks must align with sample IDs")
+        if any(
+            len(row) != len(self.bssid_vocabulary)
+            for row in self.sample_rssi_features
+        ) or any(
+            len(row) != len(self.bssid_vocabulary)
+            for row in self.sample_rssi_observation_masks
+        ):
+            raise ValueError("sample RSSI rows and masks must align with AP vocabulary")
+        if any(
+            not math.isfinite(value)
+            for row in self.sample_rssi_features
+            for value in row
+        ):
+            raise ValueError("sample normalized RSSI features must be finite")
+        if any(
+            value != 0.0
+            for feature_row, mask_row in zip(
+                self.sample_rssi_features, self.sample_rssi_observation_masks
+            )
+            for value, observed in zip(feature_row, mask_row)
+            if not observed
+        ):
+            raise ValueError("unobserved RSSI columns must be zero in pair-mining features")
         if len(self.reference_sample_mask) != node_count or len(self.new_sample_mask) != node_count:
             raise ValueError("sample role masks must align with all node rows")
         if len(self.reference_label_mask) != node_count or len(self.reference_coordinate_targets) != node_count:
@@ -290,8 +391,26 @@ class GraphState(BaseModel):
                         min_y < max_y and not min_y <= y < max_y
                     ):
                         raise ValueError("pseudo-location y is outside recorded map bounds")
-                if self.node_features[row][self.encoder_feature_dim:] != initialization.xy:
-                    raise ValueError("sample graph feature must end with its declared location input")
+                position_feature = self.node_features[row][self.encoder_feature_dim:]
+                if self.build_config.spatial_normalization_enabled:
+                    transform_metadata = self.build_config.spatial_transform_metadata
+                    if transform_metadata is None:
+                        raise ValueError("normalized graph lacks fitted transform metadata")
+                    if labeled:
+                        expected_position = tuple(
+                            (value - center) / transform_metadata.scale
+                            * self.build_config.position_weight
+                            for value, center in zip(initialization.xy, transform_metadata.center)
+                        )
+                    else:
+                        # ``reference_label_mask`` is the position-availability
+                        # mask: hidden/evaluation labels and pseudo locations
+                        # never enter the normalized feature block.
+                        expected_position = (0.0, 0.0)
+                else:
+                    expected_position = initialization.xy
+                if not _features_close(position_feature, expected_position):
+                    raise ValueError("sample graph position block disagrees with its availability and transform")
             else:
                 if ref or new or labeled or target is not None:
                     raise ValueError("AP nodes cannot carry sample coordinate masks/labels")
@@ -337,12 +456,17 @@ class GraphState(BaseModel):
             if pair in virtual_pairs:
                 raise ValueError("duplicate virtual sample edge")
             virtual_pairs.add(pair)
-            similarity = _cosine_similarity(
-                self.node_features[row_by_id[pair[0]]],
-                self.node_features[row_by_id[pair[1]]],
+            left_row = row_by_id[pair[0]]
+            right_row = row_by_id[pair[1]]
+            similarity = normalized_rssi_cosine(
+                self.sample_rssi_features[left_row],
+                self.sample_rssi_features[right_row],
+                self.sample_rssi_observation_masks[left_row],
+                self.sample_rssi_observation_masks[right_row],
+                minimum_shared_aps=self.build_config.minimum_shared_aps,
             )
             if similarity is None or not math.isclose(similarity, edge.cosine_similarity, abs_tol=1e-12):
-                raise ValueError("virtual edge similarity does not match augmented node features")
+                raise ValueError("virtual edge similarity does not match normalized RSSI")
             if self.build_config.virtual_edge_strategy == "paper_cosine_threshold":
                 if not similarity > self.build_config.virtual_edge_sigma:
                     raise ValueError("paper virtual edges require cosine similarity strictly above sigma")
@@ -353,12 +477,16 @@ class GraphState(BaseModel):
             if not _features_close(edge.edge_feature, expected_edge_feature):
                 raise ValueError("virtual edge feature must be the endpoint mean")
 
-        sample_features_by_id = {
-            sample_id: self.node_features[row_by_id[sample_id]]
-            for sample_id in self.sample_node_ids
-        }
-        expected_virtual_edges = _similarity_pairs(
-            self.sample_node_ids, sample_features_by_id, self.build_config
+        expected_virtual_edges, expected_negative_pairs = mine_rssi_pairs(
+            self.sample_node_ids,
+            self.sample_rssi_features,
+            self.sample_rssi_observation_masks,
+            virtual_edge_sigma=self.build_config.virtual_edge_sigma,
+            negative_similarity_threshold=self.build_config.negative_similarity_threshold,
+            minimum_shared_aps=self.build_config.minimum_shared_aps,
+            max_negative_pairs_per_sample=self.build_config.max_negative_pairs_per_sample,
+            virtual_edge_strategy=self.build_config.virtual_edge_strategy,
+            top_k=self.build_config.top_k,
         )
         actual_virtual_edges = tuple(
             (edge.sample_node_id_left, edge.sample_node_id_right, edge.cosine_similarity)
@@ -369,7 +497,9 @@ class GraphState(BaseModel):
             or not math.isclose(expected_item[2], actual_item[2], abs_tol=1e-12)
             for expected_item, actual_item in zip(expected_virtual_edges, actual_virtual_edges)
         ):
-            raise ValueError("virtual edge table does not match configured similarity policy")
+            raise ValueError("virtual edge table does not match configured RSSI similarity policy")
+        if expected_negative_pairs != self.negative_pairs:
+            raise ValueError("negative-pair table does not match configured RSSI mining policy")
 
         if self.radio_edges != tuple(
             sorted(self.radio_edges, key=lambda edge: (edge.sample_node_id, edge.ap_node_id))
@@ -450,18 +580,6 @@ def _features_close(left: tuple[float, ...], right: tuple[float, ...]) -> bool:
     )
 
 
-def _cosine_similarity(
-    left: tuple[float, ...], right: tuple[float, ...]
-) -> float | None:
-    left_norm_sq = sum(value * value for value in left)
-    right_norm_sq = sum(value * value for value in right)
-    if left_norm_sq == 0.0 or right_norm_sq == 0.0:
-        return None
-    dot = sum(a * b for a, b in zip(left, right))
-    similarity = dot / math.sqrt(left_norm_sq * right_norm_sq)
-    return max(-1.0, min(1.0, similarity))
-
-
 def _pseudo_location(
     scan: PreparedScan,
     seed: int,
@@ -508,9 +626,9 @@ def _resolve_pseudo_location_config(
         )
     xs = tuple(x for x, _y in reference_positions.values())
     ys = tuple(y for _x, y in reference_positions.values())
-    config_data = config.model_dump(mode="json")
-    config_data["pseudo_location_bounds"] = (min(xs), max(xs), min(ys), max(ys))
-    return GraphBuildConfig.model_validate(config_data)
+    return config.model_copy(
+        update={"pseudo_location_bounds": (min(xs), max(xs), min(ys), max(ys))}
+    )
 
 
 def _graph_id(
@@ -528,6 +646,44 @@ def _graph_id(
         "node_ids": node_ids,
     }
     return "graph:" + canonical_json_digest(identity)
+
+
+def resolve_spatial_transform(
+    config: GraphBuildConfig, site_id: str
+) -> tuple[GraphBuildConfig, FittedSpatialTransform | None]:
+    """Load the configured frozen transform and bind its full metadata to config."""
+    if not config.spatial_normalization_enabled:
+        return config, None
+    if not config.spatial_transform_path:
+        raise GraphConstructionError(
+            "spatial normalization is enabled but spatial_transform_path is missing"
+        )
+    transform = load_spatial_transform(config.spatial_transform_path)
+    if transform.site_id != site_id:
+        raise GraphConstructionError(
+            f"spatial transform site_id {transform.site_id!r} does not match dataset/site {site_id!r}"
+        )
+    if (
+        config.spatial_transform_sha256 is not None
+        and config.spatial_transform_sha256 != transform.transform_sha256
+    ):
+        raise GraphConstructionError(
+            "saved spatial transform differs from the transform recorded in graph configuration"
+        )
+    if (
+        config.spatial_transform_metadata is not None
+        and config.spatial_transform_metadata != transform.metadata
+    ):
+        raise GraphConstructionError(
+            "saved spatial transform metadata differs from the graph configuration"
+        )
+    resolved = config.model_copy(
+        update={
+            "spatial_transform_sha256": transform.transform_sha256,
+            "spatial_transform_metadata": transform.metadata,
+        }
+    )
+    return resolved, transform
 
 
 def _validate_inputs(
@@ -556,44 +712,19 @@ def _validate_inputs(
         raise GraphConstructionError("encoder feature width must be positive")
 
 
-def _similarity_pairs(
-    sample_node_ids: tuple[str, ...],
-    features_by_scan_id: dict[str, tuple[float, ...]],
-    config: GraphBuildConfig,
-) -> tuple[tuple[str, str, float], ...]:
-    similarities: dict[tuple[str, str], float] = {}
-    neighbors_by_id: dict[str, list[tuple[str, float]]] = {
-        sample_id: [] for sample_id in sample_node_ids
-    }
-    for index, left_id in enumerate(sample_node_ids):
-        for right_id in sample_node_ids[index + 1 :]:
-            similarity = _cosine_similarity(features_by_scan_id[left_id], features_by_scan_id[right_id])
-            if similarity is not None:
-                pair = tuple(sorted((left_id, right_id)))
-                similarities[pair] = similarity
-                neighbors_by_id[left_id].append((right_id, similarity))
-                neighbors_by_id[right_id].append((left_id, similarity))
-
-    if config.virtual_edge_strategy == "paper_cosine_threshold":
-        chosen = {
-            pair for pair, similarity in similarities.items()
-            if similarity > config.virtual_edge_sigma
-        }
-    else:
-        # Named alternative: directed KNN selections are merged as one undirected
-        # edge if either endpoint selects the other. Ties break by stable scan ID.
-        neighbor_pairs: set[tuple[str, str]] = set()
-        for sample_id in sorted(sample_node_ids):
-            candidates = neighbors_by_id[sample_id]
-            candidates.sort(key=lambda item: (-item[1], item[0]))
-            for neighbor_id, _similarity in candidates[: config.top_k]:
-                neighbor_pairs.add(tuple(sorted((sample_id, neighbor_id))))
-        chosen = neighbor_pairs
-
-    return tuple(
-        (left_id, right_id, similarities[(left_id, right_id)])
-        for left_id, right_id in sorted(chosen)
+def _normalized_rssi_rows(
+    prepared: PreparedDataset,
+) -> tuple[tuple[tuple[float, ...], ...], tuple[tuple[bool, ...], ...]]:
+    """Return measured normalized RSSI and masks in prepared scan order."""
+    values = prepared.ae_matrix()
+    masks = prepared.mask_matrix()
+    rows = tuple(
+        tuple(float(value) if observed else 0.0 for value, observed in zip(row, mask))
+        for row, mask in zip(values, masks)
     )
+    if len(rows) != len(prepared.scans):
+        raise GraphConstructionError("normalized RSSI rows do not match prepared scans")
+    return rows, masks
 
 
 def build_graph_state(
@@ -612,6 +743,9 @@ def build_graph_state(
     """
     selected_config = config or GraphBuildConfig()
     _validate_inputs(prepared, encoder_features)
+    selected_config, spatial_transform = resolve_spatial_transform(
+        selected_config, prepared.config.dataset_id
+    )
     feature_by_scan_id = {
         scan_id: tuple(row)
         for scan_id, row in zip(encoder_features.scan_ids, encoder_features.feature_matrix)
@@ -646,10 +780,25 @@ def build_graph_state(
             SampleLocationInitialization(scan_id=scan.scan_id, xy=xy, source=source)
         )
 
-    sample_feature_by_id = {
-        initialization.scan_id: feature_by_scan_id[initialization.scan_id] + initialization.xy
-        for initialization in sample_initializations
-    }
+    sample_feature_by_id = {}
+    for initialization in sample_initializations:
+        position_raw = initialization.xy
+        if spatial_transform is None:
+            position_feature = position_raw
+        else:
+            position_available = initialization.scan_id in reference_positions
+            position_normalized = normalized_position_feature(
+                spatial_transform,
+                position_raw,
+                available=position_available,
+            )
+            position_feature = tuple(
+                float(value) * selected_config.position_weight
+                for value in position_normalized.tolist()
+            )
+        sample_feature_by_id[initialization.scan_id] = (
+            feature_by_scan_id[initialization.scan_id] + tuple(position_feature)
+        )
     scan_by_id = {scan.scan_id: scan for scan in prepared.scans}
     bssid_to_column = {bssid: column for column, bssid in enumerate(prepared.bssid_vocabulary)}
     ap_weight_by_scan: dict[tuple[str, str], tuple[float, float]] = {}
@@ -729,10 +878,20 @@ def build_graph_state(
             )
         )
 
+    sample_rssi_features, sample_rssi_masks = _normalized_rssi_rows(prepared)
+    virtual_pairs, negative_pairs = mine_rssi_pairs(
+        scan_ids,
+        sample_rssi_features,
+        sample_rssi_masks,
+        virtual_edge_sigma=selected_config.virtual_edge_sigma,
+        negative_similarity_threshold=selected_config.negative_similarity_threshold,
+        minimum_shared_aps=selected_config.minimum_shared_aps,
+        max_negative_pairs_per_sample=selected_config.max_negative_pairs_per_sample,
+        virtual_edge_strategy=selected_config.virtual_edge_strategy,
+        top_k=selected_config.top_k,
+    )
     virtual_edges = []
-    for left_id, right_id, similarity in _similarity_pairs(
-        scan_ids, sample_feature_by_id, selected_config
-    ):
+    for left_id, right_id, similarity in virtual_pairs:
         virtual_edges.append(
             VirtualGraphEdge(
                 edge_id=f"virtual:{left_id}|{right_id}",
@@ -772,6 +931,11 @@ def build_graph_state(
     )
     return GraphState(
         graph_id=graph_id,
+        graph_feature_space=(
+            NORMALIZED_GRAPH_FEATURE_SPACE
+            if selected_config.spatial_normalization_enabled
+            else GRAPH_FEATURE_SPACE
+        ),
         dataset_id=prepared.config.dataset_id,
         batch_id=prepared.config.batch_id,
         batch_role=prepared.config.batch_role,
@@ -793,6 +957,8 @@ def build_graph_state(
         ap_node_ids=observed_ap_node_ids,
         omitted_unobserved_ap_ids=omitted_ap_ids,
         node_features=node_features,
+        sample_rssi_features=sample_rssi_features,
+        sample_rssi_observation_masks=sample_rssi_masks,
         reference_sample_mask=reference_sample_mask,
         new_sample_mask=new_sample_mask,
         reference_label_mask=reference_label_mask,
@@ -800,6 +966,7 @@ def build_graph_state(
         sample_location_initializations=tuple(sample_initializations),
         radio_edges=tuple(radio_edges),
         virtual_edges=tuple(virtual_edges),
+        negative_pairs=negative_pairs,
     )
 
 

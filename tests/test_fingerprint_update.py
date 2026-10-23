@@ -558,6 +558,33 @@ def test_update_uses_current_link_prediction_snapshot_and_inverse_normalization(
     assert ae_value_to_raw_dbm(-0.5, "legacy_raw_div_120") == pytest.approx(-60.0)
 
 
+def test_online_virtual_similarity_keeps_encoder_signal_separate_from_graph_vectors(pipeline):
+    context = make_context(pipeline)
+    graph = context.online_graph
+    assert graph.similarity_space == "z_encoder_signal_only_v1"
+    assert graph.node_feature_dim == graph.encoder_feature_dim + 2
+    assert len(graph.sample_signal_features) == len(graph.sample_node_ids)
+    signal_by_id = dict(zip(graph.sample_node_ids, graph.sample_signal_features))
+    reference_rows = pipeline.graph.id_to_row
+    update_feature_by_id = dict(
+        zip(pipeline.update_encoder.scan_ids, pipeline.update_encoder.feature_matrix)
+    )
+    for scan_id in graph.reference_sample_ids:
+        assert signal_by_id[scan_id] == pytest.approx(
+            pipeline.graph.node_features[reference_rows[scan_id]][: graph.encoder_feature_dim]
+        )
+    for scan_id in graph.update_sample_ids:
+        assert signal_by_id[scan_id] == pytest.approx(update_feature_by_id[scan_id])
+    for edge in graph.virtual_edges:
+        left = np.asarray(signal_by_id[edge.left_sample_id])
+        right = np.asarray(signal_by_id[edge.right_sample_id])
+        expected = float(
+            np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right))
+        )
+        assert edge.cosine_similarity == pytest.approx(expected, abs=1e-12)
+        assert len(edge.feature) == graph.node_feature_dim
+
+
 def test_streaming_online_graph_matches_updater_by_stable_ids(pipeline, tmp_path):
     config = LinkPredictionConfig(
         max_iterations=2,
@@ -594,6 +621,13 @@ def test_streaming_online_graph_matches_updater_by_stable_ids(pipeline, tmp_path
     assert actual_manifest.node_ids == expected.node_ids
     assert actual_manifest.online_graph_id.startswith("onlinegraph:")
     assert actual_manifest.labeled_reference_ids == expected.labeled_reference_ids
+    assert actual_manifest.similarity_feature_space == "z_encoder_signal_only_v1"
+    np.testing.assert_allclose(
+        streamed.sample_signal_features,
+        np.asarray(expected.sample_signal_features),
+        rtol=0,
+        atol=1e-12,
+    )
 
     row_by_id = {node_id: row for row, node_id in enumerate(actual_manifest.node_ids)}
     for node_id, expected_row in zip(expected.node_ids, expected.node_features):
@@ -632,6 +666,13 @@ def test_streaming_online_graph_matches_updater_by_stable_ids(pipeline, tmp_path
         (edge.left_sample_id, edge.right_sample_id): edge.cosine_similarity
         for edge in expected.virtual_edges
     }
+    signal_by_id = dict(zip(expected.sample_node_ids, expected.sample_signal_features))
+    for pair, similarity in expected_virtual.items():
+        left, right = (np.asarray(signal_by_id[scan_id]) for scan_id in pair)
+        expected_signal_cosine = float(
+            np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right))
+        )
+        assert similarity == pytest.approx(expected_signal_cosine, abs=1e-12)
     assert actual_virtual.keys() == expected_virtual.keys()
     for pair, similarity in expected_virtual.items():
         assert actual_virtual[pair] == pytest.approx(similarity, abs=1e-12)

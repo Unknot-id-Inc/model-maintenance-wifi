@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "site_id": "GF",
+  "method": "unique_centroid_max_radius",
+  "center": [
+    417.8094128413554,
+    427.5767924937898
+  ],
+  "scale": 140.68360913654925,
+  "coordinate_units": "unknown",
+  "axis_order": [
+    "x",
+    "y"
+  ],
+  "labeled_row_count": 392,
+  "unique_position_count": 392,
+  "raw_coordinate_minima": [
+    330.8572544802849,
+    338.8815904997486
+  ],
+  "raw_coordinate_maxima": [
+    551.2424329390002,
+    485.48587753393474
+  ],
+  "provenance": {
+    "source_file": "/home/oem/GUFU/input/GF/fingerprint0.txt",
+    "source_sha256": "b7ef4c42030d66f3dcb2edaef907332767c8458f8e04edea06b2bd9c512e025a"
+  }
+}

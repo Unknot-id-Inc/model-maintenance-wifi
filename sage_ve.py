@@ -8,6 +8,7 @@ no input for the learned edge vectors required by Algorithm 1.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,8 +35,8 @@ from training_progress import (
     validate_log_interval,
 )
 
-GNN_ARCHITECTURE_ID = "gufu_algorithm1_edge_feature_mean_v1"
-GNN_CHECKPOINT_FORMAT = "gufu_gnn_checkpoint_v1"
+GNN_ARCHITECTURE_ID = "gufu_algorithm1_edge_feature_mean_softplus_cosine_v3"
+GNN_CHECKPOINT_FORMAT = "gufu_gnn_checkpoint_v5"
 GNN_FEATURE_FORMAT = "gufu_gnn_features_v1"
 DEFAULT_GNN_DIM = 34
 
@@ -49,7 +50,7 @@ class GNNModelConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    architecture_id: Literal["gufu_algorithm1_edge_feature_mean_v1"] = (
+    architecture_id: Literal["gufu_algorithm1_edge_feature_mean_softplus_cosine_v3"] = (
         GNN_ARCHITECTURE_ID
     )
     graph_feature_dim: int = Field(default=DEFAULT_GNN_DIM, ge=1)
@@ -63,7 +64,7 @@ class GNNModelConfig(BaseModel):
     aggregation: Literal["mean_edge_neighbor_message_v1"] = (
         "mean_edge_neighbor_message_v1"
     )
-    activation: Literal["relu"] = "relu"
+    activation: Literal["leaky_relu"] = "leaky_relu"
     edge_update_scope: Literal["physical_radio_edges_only"] = (
         "physical_radio_edges_only"
     )
@@ -76,8 +77,8 @@ class GNNModelConfig(BaseModel):
     ] = "ap_initialization_only_not_algorithm1_or_eq4"
     optimizer: Literal["Adam"] = "Adam"
     dropout_placement: Literal[
-        "after_relu_before_mean_or_l2_normalization_inferred"
-    ] = "after_relu_before_mean_or_l2_normalization_inferred"
+        "after_leaky_relu_before_mean_or_l2_normalization_inferred"
+    ] = "after_leaky_relu_before_mean_or_l2_normalization_inferred"
     zero_vector_policy: Literal["l2_normalize_eps_preserve_zero"] = (
         "l2_normalize_eps_preserve_zero"
     )
@@ -111,11 +112,16 @@ class GNNTrainingConfig(BaseModel):
     weight_decay: float = Field(default=0.0, ge=0.0)
     seed: int = 0
     optimizer: Literal["Adam"] = "Adam"
-    objective: Literal["eq4_relu_log_sum_clamped_v1"] = "eq4_relu_log_sum_clamped_v1"
+    objective: Literal[
+        "positive_negative_cosine_softplus_v1"
+    ] = "positive_negative_cosine_softplus_v1"
+    contrastive_temperature: float = Field(default=0.1, gt=0.0)
+    negative_weight: float = Field(default=1.0, ge=0.0)
+    # Retained as an ignored config field for callers that still provide it.
     objective_epsilon: float = Field(default=1.0e-12, gt=0.0)
-    objective_reduction: Literal["sum_over_each_undirected_edge_once"] = (
-        "sum_over_each_undirected_edge_once"
-    )
+    objective_reduction: Literal[
+        "mean_positive_softplus_plus_weighted_mean_negative_softplus_v1"
+    ] = "mean_positive_softplus_plus_weighted_mean_negative_softplus_v1"
     selection_policy: Literal["final_training_epoch"] = "final_training_epoch"
     run_mode: Literal["independent_experiment_no_resume"] = (
         "independent_experiment_no_resume"
@@ -129,6 +135,10 @@ class GNNTrainingConfig(BaseModel):
             raise ValueError("weight_decay must be finite")
         if not torch.isfinite(torch.tensor(self.objective_epsilon)).item():
             raise ValueError("objective_epsilon must be finite")
+        if not torch.isfinite(torch.tensor(self.contrastive_temperature)).item():
+            raise ValueError("contrastive_temperature must be finite")
+        if not torch.isfinite(torch.tensor(self.negative_weight)).item():
+            raise ValueError("negative_weight must be finite")
         return self
 
 
@@ -137,8 +147,8 @@ class GNNCheckpointManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_gnn_checkpoint_v1"] = GNN_CHECKPOINT_FORMAT
-    architecture_id: Literal["gufu_algorithm1_edge_feature_mean_v1"] = (
+    format: Literal["gufu_gnn_checkpoint_v5"] = GNN_CHECKPOINT_FORMAT
+    architecture_id: Literal["gufu_algorithm1_edge_feature_mean_softplus_cosine_v3"] = (
         GNN_ARCHITECTURE_ID
     )
     model_config_record: GNNModelConfig
@@ -331,6 +341,9 @@ class GraphTensorInput(NamedTuple):
     edge_ids: tuple[str, ...]
     radio_edge_ids: tuple[str, ...]
     virtual_edge_ids: tuple[str, ...]
+    negative_left_rows: Tensor | None = None
+    negative_right_rows: Tensor | None = None
+    negative_pair_strengths: Tensor | None = None
 
 
 class GNNOutput(NamedTuple):
@@ -483,7 +496,9 @@ class EdgeFeatureSAGE(nn.Module):
                 )
 
             node_inputs = torch.cat((node_features, aggregate), dim=1)
-            node_features = F.relu(F.linear(node_inputs, self.W1[layer]))
+            node_features = F.leaky_relu(
+                F.linear(node_inputs, self.W1[layer]), negative_slope=0.1
+            )
             node_features = F.dropout(
                 node_features,
                 p=self.config.dropout_probability,
@@ -497,7 +512,7 @@ class EdgeFeatureSAGE(nn.Module):
             if radio_count:
                 radio_left = tensors.edge_left_rows[:radio_count]
                 radio_right = tensors.edge_right_rows[:radio_count]
-                updated_radio = F.relu(
+                updated_radio = F.leaky_relu(
                     F.linear(
                         torch.cat(
                             (
@@ -508,7 +523,8 @@ class EdgeFeatureSAGE(nn.Module):
                             dim=1,
                         ),
                         self.W2[layer],
-                    )
+                    ),
+                    negative_slope=0.1,
                 )
                 updated_radio = F.dropout(
                     updated_radio,
@@ -579,6 +595,97 @@ def graph_state_to_tensors(
         edge_ids=edge_ids,
         radio_edge_ids=tuple(edge.edge_id for edge in radio_edges),
         virtual_edge_ids=tuple(edge.edge_id for edge in virtual_edges),
+        negative_left_rows=torch.tensor(
+            [row_by_id[pair.left_sample_id] for pair in graph_state.negative_pairs],
+            dtype=torch.long,
+            device=device,
+        ),
+        negative_right_rows=torch.tensor(
+            [row_by_id[pair.right_sample_id] for pair in graph_state.negative_pairs],
+            dtype=torch.long,
+            device=device,
+        ),
+        negative_pair_strengths=torch.tensor(
+            [pair.negative_strength for pair in graph_state.negative_pairs],
+            dtype=dtype,
+            device=device,
+        ),
+    )
+
+
+def cosine_softplus_pair_losses(
+    node_embeddings: Tensor,
+    positive_pairs: Tensor,
+    negative_pairs: Tensor,
+    *,
+    temperature: float,
+) -> tuple[Tensor, Tensor]:
+    """Return mean softplus losses for positive and negative cosine pairs."""
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("contrastive temperature must be finite and positive")
+    if node_embeddings.ndim != 2:
+        raise ValueError("node embeddings must have shape [nodes, dimensions]")
+    for name, pairs in (("positive", positive_pairs), ("negative", negative_pairs)):
+        if pairs.ndim != 2 or pairs.shape[0] != 2:
+            raise ValueError(f"{name} pairs must have shape [2, number_of_pairs]")
+        if pairs.shape[1] == 0:
+            raise ValueError(f"cosine softplus loss requires nonempty {name} pairs")
+        if pairs.device != node_embeddings.device:
+            raise ValueError(f"{name} pairs and node embeddings must share a device")
+    normalized = F.normalize(node_embeddings, p=2, dim=-1)
+    positive_cosines = (
+        normalized[positive_pairs[0]] * normalized[positive_pairs[1]]
+    ).sum(dim=-1)
+    negative_cosines = (
+        normalized[negative_pairs[0]] * normalized[negative_pairs[1]]
+    ).sum(dim=-1)
+    positive_loss = F.softplus(-positive_cosines / temperature).mean()
+    negative_loss = F.softplus(negative_cosines / temperature).mean()
+    return positive_loss, negative_loss
+
+
+def equation4_loss_components(
+    node_features: Tensor,
+    graph_state: GraphState,
+    *,
+    temperature: float = 0.1,
+) -> tuple[Tensor, Tensor]:
+    """Return the positive and negative mean losses for a GraphState."""
+    if node_features.ndim != 2 or node_features.shape != (
+        len(graph_state.node_ids),
+        graph_state.node_feature_dim,
+    ):
+        raise ValueError("node embedding width must match the graph feature width")
+    if not graph_state.radio_edges and not graph_state.virtual_edges:
+        raise GNNTrainingError("cosine loss requires at least one positive pair")
+    if not graph_state.negative_pairs:
+        raise GNNTrainingError("cosine loss requires at least one mined negative pair")
+    row_by_id = dict(graph_state.node_id_to_row)
+    positive_left_ids = [edge.sample_node_id for edge in graph_state.radio_edges]
+    positive_right_ids = [edge.ap_node_id for edge in graph_state.radio_edges]
+    positive_left_ids.extend(edge.sample_node_id_left for edge in graph_state.virtual_edges)
+    positive_right_ids.extend(edge.sample_node_id_right for edge in graph_state.virtual_edges)
+    positive_pairs = torch.tensor(
+        [
+            [row_by_id[node_id] for node_id in positive_left_ids],
+            [row_by_id[node_id] for node_id in positive_right_ids],
+        ],
+        dtype=torch.long,
+        device=node_features.device,
+    )
+    negative_pairs = torch.tensor(
+        [
+            [row_by_id[pair.left_sample_id] for pair in graph_state.negative_pairs],
+            [row_by_id[pair.right_sample_id] for pair in graph_state.negative_pairs],
+        ],
+        dtype=torch.long,
+        device=node_features.device,
+    )
+    return cosine_softplus_pair_losses(
+        node_features,
+        positive_pairs,
+        negative_pairs,
+        temperature=temperature,
     )
 
 
@@ -586,28 +693,202 @@ def equation4_loss(
     node_features: Tensor,
     graph_state: GraphState,
     *,
-    epsilon: float = 1.0e-12,
+    temperature: float = 0.1,
+    negative_weight: float = 1.0,
+    epsilon: float | None = None,
 ) -> Tensor:
-    """Eq. 4: ``-sum(log(ReLU(z_u dot z_v)))`` over unique graph edges.
+    """Mean softplus cosine losses on graph positives and mined negatives."""
+    if not math.isfinite(negative_weight) or negative_weight < 0.0:
+        raise ValueError("negative_weight must be finite and nonnegative")
+    positive_loss, negative_loss = equation4_loss_components(
+        node_features,
+        graph_state,
+        temperature=temperature,
+    )
+    return positive_loss + negative_weight * negative_loss
 
-    A lower clamp at ``epsilon`` is the named numerical inference needed to
-    keep the paper's ReLU/log expression finite at zero. It adds no pairs or
-    alternate activation; entries at/below zero have zero ReLU gradient.
-    Canonical undirected radio and virtual edge records each contribute once.
+
+class _StreamingOriginalLoss(torch.autograd.Function):
+    """Exact blockwise forward/backward for the original all-pairs objective."""
+
+    @staticmethod
+    def forward(ctx, output, target, sigma: float, epsilon: float, chunk_size: int):
+        edge_count = output.shape[0]
+        if edge_count == 0:
+            raise GNNTrainingError("original LossFunc requires at least one graph edge")
+
+        with torch.no_grad():
+            # The original threshold expression reduces to the mean of its
+            # normalized pairwise-similarity matrix; compute that scalar
+            # without materializing the matrix.
+            global_norm = (
+                torch.linalg.vector_norm(output) * torch.linalg.vector_norm(target)
+            ).clamp_min(epsilon)
+            pairwise_mean = torch.dot(output.sum(dim=0), target.sum(dim=0)) / (
+                float(edge_count * edge_count) * global_norm
+            )
+            subtract_diagonal = pairwise_mean.item() > sigma
+            diagonal = (output * target).sum(dim=1) if subtract_diagonal else None
+
+            # Column norms of output @ target.T can be derived from the small
+            # feature-space Gram matrix. For the legacy broadcast diagonal
+            # subtraction, apply ||s_j - d_j*1||^2 = ||s_j||^2 - 2*d_j*sum(s_j)
+            # + E*d_j^2. This avoids an E-by-E allocation.
+            gram = output.transpose(0, 1) @ output
+            column_norm_sq = ((target @ gram) * target).sum(dim=1)
+            if subtract_diagonal:
+                column_sums = target @ output.sum(dim=0)
+                column_norm_sq = (
+                    column_norm_sq
+                    - 2.0 * diagonal * column_sums
+                    + float(edge_count) * diagonal.square()
+                )
+            column_norms = column_norm_sq.clamp_min(0.0).sqrt()
+            column_denominators = column_norms.clamp_min(epsilon)
+
+            # The backward pass needs sum_i(sigmoid'(M_ij) * M_ij) for each
+            # column. Accumulate it while evaluating the forward loss.
+            sigmoid_prime_dot_similarity = torch.zeros_like(column_denominators)
+            loss_sum = output.new_zeros(())
+            target_t = target.transpose(0, 1)
+            for start in range(0, edge_count, chunk_size):
+                stop = min(start + chunk_size, edge_count)
+                similarities = output[start:stop] @ target_t
+                if subtract_diagonal:
+                    similarities = similarities - diagonal.unsqueeze(0)
+                probabilities = torch.sigmoid(similarities / column_denominators)
+                loss_sum = loss_sum + probabilities.sum()
+                sigmoid_prime = probabilities * (1.0 - probabilities)
+                sigmoid_prime_dot_similarity += (sigmoid_prime * similarities).sum(
+                    dim=0
+                )
+
+            ctx.save_for_backward(
+                output,
+                target,
+                column_norms,
+                column_denominators,
+                sigmoid_prime_dot_similarity,
+            )
+            ctx.edge_count = edge_count
+            ctx.epsilon = epsilon
+            ctx.chunk_size = chunk_size
+            ctx.subtract_diagonal = subtract_diagonal
+            return loss_sum / float(edge_count * edge_count)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            output,
+            target,
+            column_norms,
+            column_denominators,
+            sigmoid_prime_dot_similarity,
+        ) = ctx.saved_tensors
+        edge_count = ctx.edge_count
+        scale = grad_output / float(edge_count * edge_count)
+        target_t = target.transpose(0, 1)
+        grad_output_features = torch.zeros_like(output)
+        grad_target_features = torch.zeros_like(target)
+        grad_by_column_sum = torch.zeros_like(column_denominators)
+        diagonal = (output * target).sum(dim=1) if ctx.subtract_diagonal else None
+
+        # Recompute each block instead of retaining all pairwise scores from
+        # forward. The derivative includes the column-wise L2 normalization.
+        for start in range(0, edge_count, ctx.chunk_size):
+            stop = min(start + ctx.chunk_size, edge_count)
+            similarities = output[start:stop] @ target_t
+            if ctx.subtract_diagonal:
+                similarities = similarities - diagonal.unsqueeze(0)
+
+            probabilities = torch.sigmoid(similarities / column_denominators)
+            sigmoid_prime = probabilities * (1.0 - probabilities)
+            grad_similarities = sigmoid_prime / column_denominators
+
+            # For columns above eps, differentiate x / ||x||. Below eps,
+            # F.normalize treats the denominator as the constant epsilon.
+            normalized_columns = column_norms >= ctx.epsilon
+            normalization_correction = (
+                sigmoid_prime_dot_similarity / column_denominators.pow(3)
+            )
+            normalization_correction = torch.where(
+                normalized_columns,
+                normalization_correction,
+                torch.zeros_like(normalization_correction),
+            )
+            grad_similarities = (
+                grad_similarities - similarities * normalization_correction.unsqueeze(0)
+            ) * scale
+
+            output_block = output[start:stop]
+            grad_output_features[start:stop] = grad_similarities @ target
+            grad_target_features += grad_similarities.transpose(0, 1) @ output_block
+            grad_by_column_sum += grad_similarities.sum(dim=0)
+
+        if ctx.subtract_diagonal:
+            # Each diagonal value was broadcast down its whole column in the
+            # original subtraction, so its gradient sums over all matrix rows.
+            grad_output_features -= grad_by_column_sum.unsqueeze(1) * target
+            grad_target_features -= grad_by_column_sum.unsqueeze(1) * output
+
+        return grad_output_features, grad_target_features, None, None, None
+
+
+def original_loss_func(
+    node_features: Tensor,
+    graph_state: GraphState,
+    sigma: float = 0.05,
+    *,
+    epsilon: float = 1.0e-12,
+    chunk_size: int = 64,
+) -> Tensor:
+    """Torch-compatible emulation of the original repository's ``LossFunc``.
+
+    ``output`` and ``target`` in the original function are constructed here
+    from the graph's canonical edge pairs: the left endpoint embeddings form
+    ``output`` and the right endpoint embeddings form ``target``. Radio edges
+    are followed by virtual edges, matching :func:`equation4_loss`; each
+    undirected edge record contributes once. These are paired node features,
+    not labels or reconstruction targets. With ``E`` edge records and node
+    width ``D``, both matrices have shape ``[E, D]``.
+
+    The original code forms ``output @ target.T``, conditionally subtracts its
+    diagonal, L2-normalizes columns, applies sigmoid, and averages. The
+    all-pairs operations run in chunks, and a custom backward recomputes each
+    chunk, keeping peak pairwise storage at ``O(chunk_size * E)`` instead of
+    ``O(E^2)``. Arithmetic remains quadratic in the number of edges. Its
+    condition compares a *matrix* of normalized pairwise similarities with
+    ``sigma`` inside a Python ``if``; that is undefined for multiple edges.
+    Here the condition is explicitly inferred as ``mean(pairwise_similarity)
+    > sigma``. When true, subtracting the diagonal vector from the matrix
+    preserves PyTorch's original column-wise broadcasting behavior.
+
+    This compatibility objective is not selected by ``train_gnn``; training
+    continues to use :func:`equation4_loss` unless a caller explicitly invokes
+    this function.
     """
-    if not torch.isfinite(torch.tensor(epsilon)).item() or epsilon <= 0.0:
-        raise ValueError("Eq. 4 epsilon must be finite and positive")
     if not graph_state.radio_edges and not graph_state.virtual_edges:
-        raise GNNTrainingError(
-            "Eq. 4 has no physical or virtual edges; the graph has no training relations"
-        )
+        raise GNNTrainingError("original LossFunc requires at least one graph edge")
     if node_features.ndim != 2 or node_features.shape != (
         len(graph_state.node_ids),
         graph_state.node_feature_dim,
     ):
         raise ValueError(
-            "Eq. 4 node embedding width must match the graph feature width"
+            "original LossFunc node embeddings must match the graph node ordering and width"
         )
+    if not node_features.is_floating_point():
+        raise TypeError("original LossFunc expects floating-point tensors")
+    if not torch.isfinite(torch.tensor(sigma)).item():
+        raise ValueError("sigma must be finite")
+    if not torch.isfinite(torch.tensor(epsilon)).item() or epsilon <= 0.0:
+        raise ValueError("epsilon must be finite and positive")
+    if (
+        isinstance(chunk_size, bool)
+        or not isinstance(chunk_size, int)
+        or chunk_size < 1
+    ):
+        raise ValueError("chunk_size must be a positive integer")
+
     row_by_id = dict(graph_state.node_id_to_row)
     left_ids = [edge.sample_node_id for edge in graph_state.radio_edges]
     right_ids = [edge.ap_node_id for edge in graph_state.radio_edges]
@@ -623,9 +904,13 @@ def equation4_loss(
         dtype=torch.long,
         device=node_features.device,
     )
-    dot_products = (node_features[left_rows] * node_features[right_rows]).sum(dim=1)
-    activated = F.relu(dot_products)
-    return -torch.log(activated.clamp_min(epsilon)).sum()
+    output = node_features[left_rows]
+    target = node_features[right_rows]
+    return _StreamingOriginalLoss.apply(output, target, sigma, epsilon, chunk_size)
+
+
+# Preserve the original class/function name for direct side-by-side experiments.
+LossFunc = original_loss_func
 
 
 def _edge_topology_digest(graph_state: GraphState) -> str:
@@ -898,11 +1183,14 @@ def load_streaming_gnn_checkpoint(
         or manifest.vocabulary_sha256 != lp_manifest.vocabulary_sha256
         or manifest.encoder_checkpoint_sha256 != lp_manifest.encoder_checkpoint_sha256
         or manifest.node_ids != lp_manifest.node_ids
-        or manifest.model_config_record.graph_feature_dim != lp_manifest.node_feature_dim
+        or manifest.model_config_record.graph_feature_dim
+        != lp_manifest.node_feature_dim
         or manifest.graph_build_config != lp_manifest.graph_build_config
         or digest != lp_manifest.gnn_checkpoint_sha256
     ):
-        raise ValueError("GNN checkpoint is incompatible with compact streaming LP identity")
+        raise ValueError(
+            "GNN checkpoint is incompatible with compact streaming LP identity"
+        )
     state_dict = payload.get("model_state")
     if not isinstance(state_dict, dict):
         raise ValueError("GNN checkpoint is missing model weights")
@@ -1037,7 +1325,7 @@ def train_gnn(
         )
     if not graph_state.radio_edges and not graph_state.virtual_edges:
         raise GNNTrainingError(
-            "cannot train Eq. 4 on a graph with no physical or virtual edges"
+            "cannot train the cosine objective on a graph with no positive pairs"
         )
     if graph_state.node_feature_dim != model.config.graph_feature_dim:
         raise GNNTrainingError("model graph feature width does not match GraphState")
@@ -1091,10 +1379,11 @@ def train_gnn(
             loss = equation4_loss(
                 output.node_features,
                 graph_state,
-                epsilon=selected_training.objective_epsilon,
+                temperature=selected_training.contrastive_temperature,
+                negative_weight=selected_training.negative_weight,
             )
             if not torch.isfinite(loss):
-                raise GNNTrainingError("Eq. 4 loss is non-finite")
+                raise GNNTrainingError("cosine softplus loss is non-finite")
             loss.backward()
             gradients = [
                 parameter.grad
@@ -1107,7 +1396,7 @@ def train_gnn(
                 raise GNNTrainingError("GNN produced no finite parameter gradients")
             if not any(torch.count_nonzero(gradient).item() for gradient in gradients):
                 raise GNNTrainingError(
-                    "Eq. 4/ReLU produced no gradient signal; no trained checkpoint was saved"
+                    "cosine softplus loss produced no gradient signal; no trained checkpoint was saved"
                 )
             optimizer.step()
             loss_history.append(float(loss.detach().to(device="cpu").item()))
@@ -1120,6 +1409,7 @@ def train_gnn(
                     "nodes": graph_state.node_count,
                     "radio_edges": graph_state.physical_edge_count,
                     "virtual_edges": graph_state.virtual_edge_count,
+                    "negative_pairs": len(graph_state.negative_pairs),
                     "learning_rate": optimizer.param_groups[0]["lr"],
                 },
                 every_k_epochs=log_every_epochs,

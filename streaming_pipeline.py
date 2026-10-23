@@ -450,6 +450,7 @@ def _process_batch(
     source_root: str | Path | None,
     initial_lp_result_directory: str | Path | None,
     stage_observer: Callable[[str, Path], None] | None,
+    progress_callback: Callable[[str], None] | None,
 ) -> tuple[Path, StreamingBatchSnapshotManifest]:
     seq = state.sequence_number + 1
     batch_id = input_path.stem
@@ -460,6 +461,10 @@ def _process_batch(
     staging = Path(
         tempfile.mkdtemp(prefix=f".staging-{seq:04d}-{batch_id}-", dir=snapshot_root)
     )
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: starting snapshot staging at {staging.name}"
+        )
     records: list[StageRecord] = []
 
     # The first snapshot captures the external cell-6 boundary so it can be
@@ -491,6 +496,10 @@ def _process_batch(
     shutil.copy2(gnn_source_path, source_gnn_checkpoint)
 
     if initial_lp_result_directory is not None and state.snapshot_id is None:
+        if progress_callback is not None:
+            progress_callback(
+                f"[pipeline] batch {batch_id}: reusing the supplied bootstrap LP result"
+            )
         lp_result_dir = _copy_tree(
             Path(initial_lp_result_directory), staging / "base_link_prediction_result"
         )
@@ -499,10 +508,15 @@ def _process_batch(
         )
     else:
         lp_result_dir = staging / "base_link_prediction_result"
+        if progress_callback is not None:
+            progress_callback(
+                f"[pipeline] batch {batch_id}: scoring links for the current reference graph"
+            )
         base_result = predict_edges_streaming(
             reference_lp_input,
             lp_result_dir,
             config.link_prediction,
+            progress_callback=progress_callback,
         )
     if base_result.manifest.outcome == "failed":
         raise RuntimeError("reference LP did not converge; refusing to train on failed graph state")
@@ -515,9 +529,18 @@ def _process_batch(
             "base_bssid_vocabulary": state.prepared.bssid_vocabulary,
         }
     )
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: preparing incoming scans from {input_path}"
+        )
     full_update = prepare_dataset_files(
         [input_path], update_preprocessing, source_root=source_root
     )
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: prepared {len(full_update.scans):,} "
+            f"incoming scans with {len(full_update.bssid_vocabulary):,} observed APs"
+        )
     reference_ids = {scan.scan_id for scan in state.prepared.scans}
     update_ids = tuple(scan.scan_id for scan in full_update.scans)
     if len(set(update_ids)) != len(update_ids) or reference_ids.intersection(update_ids):
@@ -532,6 +555,10 @@ def _process_batch(
     _stage_call(stage_observer, "update_shared_preprocessing", staging, records, "input_prepared_batch.json")
 
     update_encoder_path = staging / "update_encoder_features.json"
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: encoding incoming scans with the shared AE"
+        )
     update_encoder = encode_prepared_dataset(
         shared_update,
         source_ae_checkpoint,
@@ -539,9 +566,19 @@ def _process_batch(
         batch_size=config.encoder_batch_size,
         device=config.device,
     )
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: AE encoding complete for "
+            f"{len(update_encoder.scan_ids):,} scans"
+        )
     _stage_call(stage_observer, "update_shared_ae_encoding", staging, records, "update_encoder_features.json")
 
     online_graph_path = staging / "online_graph"
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: starting online graph construction "
+            f"for {len(state.prepared.scans) + len(shared_update.scans):,} samples"
+        )
     online_graph_manifest = build_streaming_online_graph(
         reference_lp_input,
         lp_result_dir,
@@ -549,7 +586,15 @@ def _process_batch(
         update_encoder,
         online_graph_path,
         virtual_edge_sigma=config.graph_build.virtual_edge_sigma,
+        progress_callback=progress_callback,
     )
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: online graph ready: "
+            f"nodes={len(online_graph_manifest.node_ids):,}, "
+            f"radio edges={online_graph_manifest.radio_edge_count:,}, "
+            f"virtual edges={online_graph_manifest.virtual_edge_count:,}"
+        )
     _stage_call(stage_observer, "update_graph_aggregation", staging, records, "online_graph")
 
     batch_gnn_training = config.gnn_training.model_copy(
@@ -609,6 +654,10 @@ def _process_batch(
     )
     _stage_call(stage_observer, "update_ae_update", staging, records, "ae_update")
 
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: starting AP-transition link prediction"
+        )
     ap_inference = infer_streaming_ap_graph_changes(
         reference_lp_input,
         lp_result_dir,
@@ -619,7 +668,14 @@ def _process_batch(
         candidate_index_path=staging / "ap_transition_candidates.sqlite3",
         result_directory=staging / "ap_transition_result",
         config=config.transition.link_prediction,
+        progress_callback=progress_callback,
     )
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: AP-transition link prediction finished "
+            f"({ap_inference.result.manifest.candidate_count:,} candidate edges, "
+            f"{ap_inference.result.manifest.iterations:,} propagation iterations)"
+        )
     _stage_call(stage_observer, "update_edge_prediction", staging, records, "ap_transition_result")
 
     transition_path = staging / "reference_transition"
@@ -843,6 +899,7 @@ def run_streaming_sequential(
     update_pattern: str = "fingerprint[1-9]*.txt",
     source_root: str | Path | None = None,
     stage_observer: Callable[[str, Path], None] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> StreamingPipelineResult:
     """Run or resume update batches from their preceding completed state.
 
@@ -863,6 +920,12 @@ def run_streaming_sequential(
     )
     recovered = _recover_latest(root)
     completed = _load_existing_completed(root)
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] streaming run: {len(updates):,} update batches selected; "
+            f"{len(completed):,} completed batches found; "
+            f"resume={'yes' if recovered is not None else 'no'}; output={root}"
+        )
     skipped: list[str] = []
     done_now: list[str] = []
 
@@ -933,6 +996,10 @@ def run_streaming_sequential(
             if manifest.batch_id != batch_id:
                 raise ValueError("completed input path now maps to a different batch ID")
             skipped.append(batch_id)
+            if progress_callback is not None:
+                progress_callback(
+                    f"[pipeline] batch {batch_id}: already committed; skipping"
+                )
             if manifest.snapshot_id == state.snapshot_id:
                 state = _load_runtime_from_snapshot(
                     root, existing_directory, manifest, device=config.device
@@ -956,6 +1023,7 @@ def run_streaming_sequential(
             source_root=source_root,
             initial_lp_result_directory=initial_result,
             stage_observer=stage_observer,
+            progress_callback=progress_callback,
         )
         initial_result = None
         done_now.append(batch_id)
@@ -963,11 +1031,23 @@ def run_streaming_sequential(
             root, final_directory, manifest, device=config.device
         )
         completed[key] = (final_directory, manifest)
+        if progress_callback is not None:
+            progress_callback(
+                f"[pipeline] batch {batch_id}: committed snapshot "
+                f"{final_directory.name}"
+            )
 
     latest_pair = _recover_latest(root)
     if latest_pair is None:
+        if progress_callback is not None:
+            progress_callback("[pipeline] run finished with no completed update snapshots")
         return StreamingPipelineResult(root, None, None, tuple(done_now), tuple(skipped))
     directory, manifest = latest_pair
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] run complete: batches completed now={len(done_now):,}, "
+            f"already complete={len(skipped):,}; latest snapshot={directory.name}"
+        )
     return StreamingPipelineResult(
         root=root,
         latest_snapshot_directory=directory,
