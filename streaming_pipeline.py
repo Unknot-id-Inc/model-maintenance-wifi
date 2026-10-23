@@ -108,6 +108,7 @@ class StreamingPipelineConfig(BaseModel):
     ae_chunk_size: int = Field(default=256, ge=1)
     encoder_batch_size: int = Field(default=128, ge=1)
     log_every_epochs: int = Field(default=DEFAULT_LOG_EVERY_K_EPOCHS, ge=1)
+    rssi_pair_num_workers: int = Field(default=4, ge=1)
 
     @model_validator(mode="after")
     def compatible_stages(self):
@@ -586,6 +587,7 @@ def _process_batch(
         update_encoder,
         online_graph_path,
         virtual_edge_sigma=config.graph_build.virtual_edge_sigma,
+        num_workers=config.rssi_pair_num_workers,
         progress_callback=progress_callback,
     )
     if progress_callback is not None:

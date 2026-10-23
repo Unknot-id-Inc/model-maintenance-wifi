@@ -4,6 +4,7 @@
 # Outputs: immutable stage configuration and a reusable, validated run directory.
 
 import random
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,8 @@ DATA_PROFILE = "real_dataset"
 RUN_MODE = "lp_streaming"
 # Print scalar training metrics every K epochs and at each training stage's end.
 LOG_EVERY_K_EPOCHS = 2
+# Worker processes used for normalized-RSSI relation mining in each update.
+RSSI_PAIR_NUM_WORKERS = 4
 # Choose one bootstrap AE objective. Switching it selects a separate RUN_ID and
 # checkpoint set, so one objective cannot silently reuse the other's weights.
 AE_LOSS = "mean_squared_error"  # or "batch_frobenius_norm"
@@ -89,12 +92,12 @@ if DATA_PROFILE == "real_dataset":
         negative_weight=1.0,
         gnn_epochs=1,
         updater_epochs=100,
-        ae_epochs=5,
+        ae_epochs=25,
         seed=SEED,
     )
     TRANSITION_CONFIG = TransitionConfig(
         link_prediction=LINK_CONFIG,
-        ae_finetune_epochs=5,
+        ae_finetune_epochs=25,
         ae_finetune_seed=1701,
         reinitialize_seed=1702,
     )
@@ -178,6 +181,7 @@ RUN_ID = (
 )
 RUN_DIR = Path("output") / "notebook_runs" / DATASET_ID / RUN_ID
 RUN_DIR.mkdir(parents=True, exist_ok=True)
+PIPELINE_PROGRESS_LOG_PATH = RUN_DIR / "pipeline_progress.log"
 PREPARED_PATH = RUN_DIR / "prepared_bootstrap.json"
 ENCODER_FEATURE_PATH = RUN_DIR / "encoder_features.json"
 GRAPH_STATE_PATH = RUN_DIR / "graph_state.json"
@@ -272,6 +276,7 @@ STREAMING_PIPELINE_CONFIG = StreamingPipelineConfig(
     ae_chunk_size=256,
     encoder_batch_size=AE_TRAINING_CONFIG.batch_size,
     log_every_epochs=LOG_EVERY_K_EPOCHS,
+    rssi_pair_num_workers=RSSI_PAIR_NUM_WORKERS,
 )
 STREAMING_PIPELINE_CONFIG_PATH = RUN_DIR / "streaming_pipeline_config.json"
 if STREAMING_PIPELINE_CONFIG_PATH.exists():
@@ -305,12 +310,14 @@ print(
 print(
     f"Training progress: every {LOG_EVERY_K_EPOCHS} epochs, plus each stage's final epoch"
 )
+print(f"RSSI relation mining workers: {RSSI_PAIR_NUM_WORKERS}")
 print(f"Bootstrap input: {BOOTSTRAP_PATH}")
 print(
     f"Update selection: {SELECTED_UPDATE_PATHS or SELECTED_UPDATE_DIRECTORY} "
     f"(pattern={UPDATE_INPUT_PATTERN if SELECTED_UPDATE_DIRECTORY else 'explicit one-batch smoke'})"
 )
 print(f"Notebook artifacts: {RUN_DIR} (change RUN_ID for a fresh isolated run)")
+print(f"Pipeline progress log: {PIPELINE_PROGRESS_LOG_PATH}")
 print(f"Sequential pipeline root: {PIPELINE_OUTPUT_ROOT} (resume={PIPELINE_RESUME})")
 
 # %%
@@ -657,6 +664,10 @@ from lp_streaming import (
 
 def _report_pipeline_progress(message):
     print(message, flush=True)
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    with PIPELINE_PROGRESS_LOG_PATH.open("a", encoding="utf-8") as progress_log:
+        progress_log.write(f"{timestamp} {message}\n")
+        progress_log.flush()
 
 
 streaming_lp_result = None
@@ -687,14 +698,13 @@ else:
     possible_sample_ap_pairs = len(graph_state.sample_node_ids) * len(
         graph_state.ap_node_ids
     )
-    print(
+    _report_pipeline_progress(
         "[link prediction] starting candidate scoring: "
         f"{len(graph_state.sample_node_ids)} samples × "
         f"{len(graph_state.ap_node_ids)} APs (upper bound="
         f"{possible_sample_ap_pairs:,}); "
         f"radio edges={graph_state.physical_edge_count:,}, "
-        f"virtual edges={graph_state.virtual_edge_count:,}",
-        flush=True,
+        f"virtual edges={graph_state.virtual_edge_count:,}"
     )
     if STREAMING_LP_INPUT_DIR.exists():
         _report_pipeline_progress(
@@ -740,13 +750,13 @@ else:
     assert lp_manifest.parent_graph_id == graph_state.graph_id
     assert lp_manifest.gnn_checkpoint_sha256 == gnn_features.checkpoint_sha256
     assert lp_manifest.vocabulary_sha256 == graph_state.vocabulary_sha256
-    print(
+    _report_pipeline_progress(
         f"Link proposal for graph={lp_manifest.parent_graph_id}: "
         f"outcome={lp_manifest.outcome}, termination={lp_manifest.termination}, "
         f"iterations={lp_manifest.iterations}, residuals="
         f"({lp_manifest.goodness_residual:.6g}, {lp_manifest.fairness_residual:.6g})"
     )
-    print(
+    _report_pipeline_progress(
         f"candidate scores={lp_manifest.candidate_count:,}, "
         f"added={lp_manifest.added_count:,}, removed={lp_manifest.removed_count:,}, "
         f"AP removals={len(lp_manifest.ap_removals):,}; "
@@ -754,24 +764,23 @@ else:
         f"result radio edges={lp_manifest.updated_edge_count:,}"
     )
     if lp_manifest.failure_reason:
-        print(f"Link prediction failure: {lp_manifest.failure_reason}")
-    print(f"Streaming input: {STREAMING_LP_INPUT_DIR}")
-    print(f"Streaming result: {STREAMING_LP_RESULT_DIR}")
+        _report_pipeline_progress(f"Link prediction failure: {lp_manifest.failure_reason}")
+    _report_pipeline_progress(f"Streaming input: {STREAMING_LP_INPUT_DIR}")
+    _report_pipeline_progress(f"Streaming result: {STREAMING_LP_RESULT_DIR}")
     for proposal in islice(streaming_lp_result.iter_added_edges(), 10):
-        print(
+        _report_pipeline_progress(
             f"ADD {proposal.sample_node_id} -- {proposal.ap_node_id}: "
             f"weight={proposal.new_weight:.5g}"
         )
     for proposal in islice(streaming_lp_result.iter_removed_edges(), 10):
-        print(
+        _report_pipeline_progress(
             f"REMOVE {proposal.sample_node_id} -- {proposal.ap_node_id}: "
             f"old={proposal.old_weight:.5g}; predicted={proposal.predicted_weight:.5g}"
         )
-    print(
+    _report_pipeline_progress(
         "[link prediction] compact proposal is complete. In lp_streaming mode, "
         "cells 7-8 pass this exact LP input/result into the disk-backed batch "
         "orchestrator; no in-memory LP rerun is used.",
-        flush=True,
     )
     # Release the expanded Python objects before iterating the disk-backed LP
     # result. Their validated source artifacts remain in RUN_DIR.

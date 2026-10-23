@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import math
 import json
+import multiprocessing
 import os
 import shutil
 import sqlite3
 import tempfile
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty
 from time import monotonic
 from typing import Callable, Literal
 
@@ -62,6 +65,338 @@ from graph_build import SampleLocationInitialization
 
 
 ONLINE_GRAPH_FORMAT = "gufu_streaming_online_graph_v4"
+
+_VIRTUAL_PAIR_DTYPE = np.dtype(
+    [("left_pos", "<i8"), ("right_pos", "<i8"), ("similarity", "<f8")]
+)
+_RSSI_WORKER_FEATURES: np.ndarray | None = None
+_RSSI_WORKER_MASKS: np.ndarray | None = None
+_RSSI_WORKER_FEATURE_ROWS: np.ndarray | None = None
+_RSSI_WORKER_MINIMUM_SHARED_APS = 0
+_RSSI_WORKER_VIRTUAL_SIGMA = 0.0
+_RSSI_WORKER_NEGATIVE_THRESHOLD = 0.0
+_RSSI_WORKER_NEGATIVE_CAP = 0
+_RSSI_WORKER_PROGRESS_QUEUE = None
+
+
+def _initialize_rssi_pair_worker(
+    feature_path: str,
+    mask_path: str,
+    lexical_feature_rows: np.ndarray,
+    minimum_shared_aps: int,
+    virtual_edge_sigma: float,
+    negative_similarity_threshold: float,
+    max_negative_pairs_per_sample: int,
+    progress_queue,
+) -> None:
+    """Open read-only pair-mining inputs once in each worker process."""
+    global _RSSI_WORKER_FEATURES, _RSSI_WORKER_MASKS
+    global _RSSI_WORKER_FEATURE_ROWS, _RSSI_WORKER_MINIMUM_SHARED_APS
+    global _RSSI_WORKER_VIRTUAL_SIGMA, _RSSI_WORKER_NEGATIVE_THRESHOLD
+    global _RSSI_WORKER_NEGATIVE_CAP
+    global _RSSI_WORKER_PROGRESS_QUEUE
+    _RSSI_WORKER_FEATURES = np.load(feature_path, mmap_mode="r", allow_pickle=False)
+    _RSSI_WORKER_MASKS = np.load(mask_path, mmap_mode="r", allow_pickle=False)
+    _RSSI_WORKER_FEATURE_ROWS = np.asarray(lexical_feature_rows, dtype=np.int64)
+    _RSSI_WORKER_MINIMUM_SHARED_APS = int(minimum_shared_aps)
+    _RSSI_WORKER_VIRTUAL_SIGMA = float(virtual_edge_sigma)
+    _RSSI_WORKER_NEGATIVE_THRESHOLD = float(negative_similarity_threshold)
+    _RSSI_WORKER_NEGATIVE_CAP = int(max_negative_pairs_per_sample)
+    _RSSI_WORKER_PROGRESS_QUEUE = progress_queue
+
+
+def _mine_rssi_pair_chunk(
+    task: tuple[int, int, int, str],
+) -> tuple[int, int, tuple[tuple[int, int, float], ...], int]:
+    """Score one contiguous range of left endpoints and spool virtual pairs."""
+    if (
+        _RSSI_WORKER_FEATURES is None
+        or _RSSI_WORKER_MASKS is None
+        or _RSSI_WORKER_FEATURE_ROWS is None
+    ):
+        raise RuntimeError("RSSI pair worker was not initialized")
+    task_id, left_start, left_stop, spool_path = task
+    sample_count = len(_RSSI_WORKER_FEATURE_ROWS)
+    chunk_pair_count = sum(
+        sample_count - left_pos - 1 for left_pos in range(left_start, left_stop)
+    )
+    progress_step = max(1, min(100_000, math.ceil(chunk_pair_count / 4)))
+    started_at = last_progress_at = monotonic()
+    checked_pairs = virtual_count = 0
+    best_by_sample: list[list[tuple[float, int]]] = [
+        [] for _ in range(sample_count)
+    ]
+    spool_buffer: list[tuple[int, int, float]] = []
+
+    def flush_spool(spool_file) -> None:
+        if spool_buffer:
+            np.asarray(spool_buffer, dtype=_VIRTUAL_PAIR_DTYPE).tofile(spool_file)
+            spool_buffer.clear()
+
+    with open(spool_path, "wb") as spool_file:
+        for left_pos in range(left_start, left_stop):
+            left_row = int(_RSSI_WORKER_FEATURE_ROWS[left_pos])
+            left = _RSSI_WORKER_FEATURES[left_row]
+            left_mask = _RSSI_WORKER_MASKS[left_row]
+            for right_pos in range(left_pos + 1, sample_count):
+                right_row = int(_RSSI_WORKER_FEATURE_ROWS[right_pos])
+                similarity = normalized_rssi_cosine(
+                    left,
+                    _RSSI_WORKER_FEATURES[right_row],
+                    left_mask,
+                    _RSSI_WORKER_MASKS[right_row],
+                    minimum_shared_aps=_RSSI_WORKER_MINIMUM_SHARED_APS,
+                )
+                checked_pairs += 1
+                if similarity is None:
+                    continue
+                if similarity > _RSSI_WORKER_VIRTUAL_SIGMA:
+                    spool_buffer.append((left_pos, right_pos, similarity))
+                    virtual_count += 1
+                    if len(spool_buffer) >= 8192:
+                        flush_spool(spool_file)
+                elif similarity <= _RSSI_WORKER_NEGATIVE_THRESHOLD:
+                    for anchor, other in (
+                        (left_pos, right_pos),
+                        (right_pos, left_pos),
+                    ):
+                        candidates = best_by_sample[anchor]
+                        candidates.append((float(similarity), other))
+                        # lexical sample positions are already sorted by ID,
+                        # which is the sampler's deterministic tie-break.
+                        candidates.sort(key=lambda item: (-item[0], item[1]))
+                        del candidates[_RSSI_WORKER_NEGATIVE_CAP :]
+
+                now = monotonic()
+                if (
+                    checked_pairs % progress_step == 0
+                    or now - last_progress_at >= 10.0
+                ):
+                    if _RSSI_WORKER_PROGRESS_QUEUE is not None:
+                        _RSSI_WORKER_PROGRESS_QUEUE.put(
+                            (task_id, checked_pairs)
+                        )
+                    last_progress_at = now
+        flush_spool(spool_file)
+
+    negative_candidates: dict[tuple[int, int], float] = {}
+    for anchor, candidates in enumerate(best_by_sample):
+        for similarity, other in candidates:
+            edge = (min(anchor, other), max(anchor, other))
+            negative_candidates[edge] = similarity
+    ordered_candidates = tuple(
+        (left_pos, right_pos, similarity)
+        for (left_pos, right_pos), similarity in sorted(negative_candidates.items())
+    )
+    return (
+        task_id,
+        virtual_count,
+        ordered_candidates,
+        checked_pairs,
+    )
+
+
+def _parallel_mine_rssi_relations(
+    *,
+    sample_ids: tuple[str, ...],
+    lexical_feature_rows: np.ndarray,
+    signal_features_path: Path,
+    signal_masks_path: Path,
+    spool_directory: Path,
+    minimum_shared_aps: int,
+    virtual_edge_sigma: float,
+    negative_similarity_threshold: float,
+    max_negative_pairs_per_sample: int,
+    num_workers: int,
+    progress_callback: Callable[[str], None] | None,
+) -> tuple[int, BoundedNegativeSampler]:
+    """Mine relations in parallel and spool virtual edges in stable order."""
+    sample_count = len(sample_ids)
+    pair_count = sample_count * (sample_count - 1) // 2
+    sampler = BoundedNegativeSampler(
+        sample_ids,
+        negative_similarity_threshold=negative_similarity_threshold,
+        max_pairs_per_sample=max_negative_pairs_per_sample,
+    )
+    spool_directory.mkdir(parents=True, exist_ok=True)
+    available_left_rows = max(0, sample_count - 1)
+    if available_left_rows == 0:
+        if progress_callback is not None:
+            progress_callback(
+                "[pipeline] RSSI pair pass 'mine relations' complete: "
+                "0/0 pairs; virtual edges=0; negatives=0; elapsed=0.0s"
+            )
+        return 0, sampler
+
+    effective_workers = min(num_workers, available_left_rows)
+    # Balance ranges by pair count rather than row count: early left rows have
+    # many more comparisons than late rows. One range per worker also bounds
+    # the size of each worker's local negative-candidate summary.
+    def pair_prefix(left_rows: int) -> int:
+        return left_rows * (2 * sample_count - left_rows - 1) // 2
+
+    task_count = effective_workers
+    boundaries = [0]
+    for part in range(1, task_count):
+        target_pairs = pair_count * part // task_count
+        low = boundaries[-1] + 1
+        high = available_left_rows - (task_count - part)
+        while low < high:
+            middle = (low + high) // 2
+            if pair_prefix(middle) < target_pairs:
+                low = middle + 1
+            else:
+                high = middle
+        options = [low]
+        if low - 1 > boundaries[-1]:
+            options.append(low - 1)
+        boundary = min(options, key=lambda value: abs(pair_prefix(value) - target_pairs))
+        boundaries.append(boundary)
+    boundaries.append(available_left_rows)
+    task_ranges = tuple(zip(boundaries[:-1], boundaries[1:]))
+    progress_step = max(1, min(50_000, math.ceil(pair_count / 20)))
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] RSSI pair pass 'mine relations' started: "
+            f"{sample_count:,} samples, {pair_count:,} possible pairs; "
+            f"workers={effective_workers}, tasks={task_count:,}"
+        )
+
+    # Explicit fork keeps this usable from the repository's notebook-driven
+    # Linux workflow. Workers touch only read-only NumPy maps and Python math;
+    # platforms without fork use their available spawn implementation.
+    start_method = (
+        "fork"
+        if "fork" in multiprocessing.get_all_start_methods()
+        else multiprocessing.get_all_start_methods()[0]
+    )
+    context = multiprocessing.get_context(start_method)
+    progress_queue = context.Queue()
+    total_processed = 0
+    virtual_count = 0
+    completed_tasks = 0
+    active_progress: dict[int, int] = {}
+    last_reported_pairs = 0
+    started_at = last_report_at = monotonic()
+    next_task_id = 0
+    pending = {}
+
+    def task_values(task_id: int):
+        left_start, left_stop = task_ranges[task_id]
+        task_pairs = sum(
+            sample_count - left_pos - 1
+            for left_pos in range(left_start, left_stop)
+        )
+        spool_path = spool_directory / f"virtual_pairs_{left_start:012d}.bin"
+        return left_start, left_stop, task_pairs, spool_path
+
+    def submit_available(executor: ProcessPoolExecutor) -> None:
+        nonlocal next_task_id
+        while next_task_id < task_count and len(pending) < effective_workers * 2:
+            task_id = next_task_id
+            next_task_id += 1
+            left_start, left_stop, task_pairs, spool_path = task_values(task_id)
+            active_progress[task_id] = 0
+            future = executor.submit(
+                _mine_rssi_pair_chunk,
+                (task_id, left_start, left_stop, str(spool_path)),
+            )
+            pending[future] = (task_id, task_pairs)
+
+    def receive_worker_progress() -> None:
+        nonlocal total_processed
+        while True:
+            try:
+                task_id, checked_pairs = progress_queue.get_nowait()
+            except Empty:
+                return
+            previous = active_progress.get(task_id)
+            if previous is None or checked_pairs <= previous:
+                continue
+            total_processed += checked_pairs - previous
+            active_progress[task_id] = checked_pairs
+
+    def report_progress(*, force: bool = False) -> None:
+        nonlocal last_reported_pairs, last_report_at
+        now = monotonic()
+        if progress_callback is None:
+            return
+        if (
+            not force
+            and total_processed - last_reported_pairs < progress_step
+            and now - last_report_at < 10.0
+        ):
+            return
+        progress_callback(
+            f"[pipeline] RSSI pair pass 'mine relations': "
+            f"{total_processed:,}/{pair_count:,} pairs "
+            f"({total_processed / max(1, pair_count):.0%}); "
+            f"tasks={completed_tasks:,}/{task_count:,}; "
+            f"workers={effective_workers}; elapsed={now - started_at:.1f}s"
+        )
+        last_reported_pairs = total_processed
+        last_report_at = now
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=effective_workers,
+            mp_context=context,
+            initializer=_initialize_rssi_pair_worker,
+            initargs=(
+                str(signal_features_path),
+                str(signal_masks_path),
+                lexical_feature_rows,
+                minimum_shared_aps,
+                virtual_edge_sigma,
+                negative_similarity_threshold,
+                max_negative_pairs_per_sample,
+                progress_queue,
+            ),
+        ) as executor:
+            submit_available(executor)
+            while pending:
+                receive_worker_progress()
+                done, _ = wait(
+                    tuple(pending), timeout=1.0, return_when=FIRST_COMPLETED
+                )
+                receive_worker_progress()
+                for future in done:
+                    task_id, task_pairs = pending.pop(future)
+                    (
+                        result_task_id,
+                        task_virtual_count,
+                        negative_candidates,
+                        checked_pairs,
+                    ) = future.result()
+                    if result_task_id != task_id or checked_pairs != task_pairs:
+                        raise RuntimeError("RSSI pair worker returned inconsistent task results")
+                    previous = active_progress.pop(task_id, 0)
+                    total_processed += checked_pairs - previous
+                    virtual_count += task_virtual_count
+                    completed_tasks += 1
+                    for left_pos, right_pos, similarity in negative_candidates:
+                        sampler.add(left_pos, right_pos, similarity)
+                    report_progress(force=completed_tasks == task_count)
+                submit_available(executor)
+                report_progress()
+        receive_worker_progress()
+        if progress_callback is not None:
+            progress_callback(
+                f"[pipeline] RSSI pair pass 'mine relations' complete: "
+                f"{total_processed:,}/{pair_count:,} pairs; "
+                f"virtual edges={virtual_count:,}; "
+                f"negative pairs={len(sampler.selected()):,}; "
+                f"elapsed={monotonic() - started_at:.1f}s"
+            )
+    finally:
+        progress_queue.close()
+        progress_queue.join_thread()
+
+    if total_processed != pair_count:
+        raise RuntimeError(
+            f"RSSI pair mining checked {total_processed} pairs; expected {pair_count}"
+        )
+    return virtual_count, sampler
 
 
 class StreamingOnlineGraphManifest(BaseModel):
@@ -337,6 +672,7 @@ def build_streaming_online_graph(
     output_directory: str | Path,
     *,
     virtual_edge_sigma: float,
+    num_workers: int = 4,
     progress_callback: Callable[[str], None] | None = None,
 ) -> StreamingOnlineGraphManifest:
     """Build disk-backed temporary graph state directly from the streamed LP.
@@ -348,10 +684,15 @@ def build_streaming_online_graph(
     normalized RSSI rows and strict ``cosine > sigma``. Bounded negative pairs
     use the same RSSI rows with a separate conservative threshold. The full
     ``z_encoder || XY`` vectors remain in node and edge features.
+    RSSI pair mining uses up to ``num_workers`` processes (default four).
+    Accepted virtual-pair records are spooled under the staging directory and
+    replayed in stable order while the output arrays are filled.
     Update evaluation coordinates are not read for labels or initialization.
     """
     if not math.isfinite(virtual_edge_sigma) or not -1.0 <= virtual_edge_sigma <= 1.0:
         raise ValueError("virtual_edge_sigma must be finite and in [-1, 1]")
+    if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 1:
+        raise ValueError("num_workers must be a positive integer")
     input_manifest, mapped = load_streaming_lp_input(reference_lp_input_directory)
     lp_result = load_streaming_lp_result(
         reference_lp_result_directory,
@@ -654,77 +995,25 @@ def build_streaming_online_graph(
         update_row = {scan_id: row for row, scan_id in enumerate(update_sample_ids)}
         lexical_samples = tuple(sorted(sample_ids))
         sample_row = {scan_id: row for row, scan_id in enumerate(sample_ids)}
-        pair_sampler = BoundedNegativeSampler(
-            lexical_samples,
-            negative_similarity_threshold=input_manifest.graph_build_config.negative_similarity_threshold,
-            max_pairs_per_sample=input_manifest.graph_build_config.max_negative_pairs_per_sample,
+        lexical_feature_rows = np.asarray(
+            [sample_row[sample_id] for sample_id in lexical_samples], dtype=np.int64
         )
-        pair_comparison_count = len(lexical_samples) * (len(lexical_samples) - 1) // 2
-
-        def scored_pairs(pass_name: str):
-            checked_pairs = 0
-            started_at = last_progress_at = monotonic()
-            progress_step = max(
-                1, min(50_000, math.ceil(pair_comparison_count / 20))
-            )
-            if progress_callback is not None:
-                progress_callback(
-                    f"[pipeline] RSSI pair pass '{pass_name}' started: "
-                    f"{len(lexical_samples):,} samples, "
-                    f"{pair_comparison_count:,} possible pairs"
-                )
-            for left_pos, left_id in enumerate(lexical_samples):
-                left = sample_signal_features[sample_row[left_id]]
-                for right_pos in range(left_pos + 1, len(lexical_samples)):
-                    checked_pairs += 1
-                    right_id = lexical_samples[right_pos]
-                    right = sample_signal_features[sample_row[right_id]]
-                    similarity = normalized_rssi_cosine(
-                        left,
-                        right,
-                        sample_signal_masks[sample_row[left_id]],
-                        sample_signal_masks[sample_row[right_id]],
-                        minimum_shared_aps=input_manifest.graph_build_config.minimum_shared_aps,
-                    )
-                    if progress_callback is not None and (
-                        checked_pairs == 1
-                        or checked_pairs % progress_step == 0
-                        or checked_pairs % 1024 == 0
-                    ):
-                        now = monotonic()
-                        if (
-                            checked_pairs == 1
-                            or checked_pairs % progress_step == 0
-                            or now - last_progress_at >= 10.0
-                        ):
-                            progress_callback(
-                                f"[pipeline] RSSI pair pass '{pass_name}': "
-                                f"{checked_pairs:,}/{pair_comparison_count:,} pairs "
-                                f"({checked_pairs / max(1, pair_comparison_count):.0%}); "
-                                f"elapsed={now - started_at:.1f}s"
-                            )
-                            last_progress_at = now
-                    if similarity is not None:
-                        yield left_pos, right_pos, left_id, right_id, similarity
-            if progress_callback is not None:
-                progress_callback(
-                    f"[pipeline] RSSI pair pass '{pass_name}' complete: "
-                    f"{checked_pairs:,}/{pair_comparison_count:,} pairs; "
-                    f"elapsed={monotonic() - started_at:.1f}s"
-                )
-
-        virtual_count = 0
-        adjacency_counts = np.zeros((len(update_sample_ids),), dtype=np.int64)
-        for left_pos, right_pos, left_id, right_id, similarity in scored_pairs("mine relations"):
-            if similarity > virtual_edge_sigma:
-                virtual_count += 1
-                if left_id in update_row and right_id in label_col:
-                    adjacency_counts[update_row[left_id]] += 1
-                elif right_id in update_row and left_id in label_col:
-                    adjacency_counts[update_row[right_id]] += 1
-            elif similarity <= input_manifest.graph_build_config.negative_similarity_threshold:
-                pair_sampler.add(left_pos, right_pos, similarity)
+        virtual_spool_directory = staging / "virtual_pair_spool"
+        virtual_count, pair_sampler = _parallel_mine_rssi_relations(
+            sample_ids=lexical_samples,
+            lexical_feature_rows=lexical_feature_rows,
+            signal_features_path=staging / "sample_signal_features.npy",
+            signal_masks_path=staging / "sample_signal_masks.npy",
+            spool_directory=virtual_spool_directory,
+            minimum_shared_aps=input_manifest.graph_build_config.minimum_shared_aps,
+            virtual_edge_sigma=virtual_edge_sigma,
+            negative_similarity_threshold=input_manifest.graph_build_config.negative_similarity_threshold,
+            max_negative_pairs_per_sample=input_manifest.graph_build_config.max_negative_pairs_per_sample,
+            num_workers=num_workers,
+            progress_callback=progress_callback,
+        )
         negative_pairs = pair_sampler.selected()
+        adjacency_counts = np.zeros((len(update_sample_ids),), dtype=np.int64)
 
         virtual_endpoints = _open_array(
             staging / "virtual_endpoints.npy", "int64", (virtual_count, 2)
@@ -751,6 +1040,79 @@ def build_streaming_online_graph(
             )
             negative_similarities[index] = pair.signal_cosine_similarity
             negative_strengths[index] = pair.negative_strength
+        adjacency_db = sqlite3.connect(staging / "adjacency_sort.sqlite3")
+        adjacency_db.execute(
+            "CREATE TABLE adjacency (update_row INTEGER NOT NULL, ref_col INTEGER NOT NULL, "
+            "PRIMARY KEY(update_row, ref_col)) WITHOUT ROWID"
+        )
+        if progress_callback is not None:
+            progress_callback(
+                f"[pipeline] RSSI pair pass 'write virtual edges' started from "
+                f"{virtual_count:,} spooled relations"
+            )
+        virtual_write_started = last_virtual_write_progress = monotonic()
+        virtual_write_step = max(1, math.ceil(virtual_count / 20))
+        virtual_row = 0
+        spool_paths = sorted(virtual_spool_directory.glob("virtual_pairs_*.bin"))
+        for spool_path in spool_paths:
+            spool_size = spool_path.stat().st_size
+            if spool_size % _VIRTUAL_PAIR_DTYPE.itemsize:
+                raise ValueError(f"temporary virtual-pair spool is truncated: {spool_path}")
+            with spool_path.open("rb") as spool_file:
+                while True:
+                    spooled_records = np.fromfile(
+                        spool_file, dtype=_VIRTUAL_PAIR_DTYPE, count=8192
+                    )
+                    if not len(spooled_records):
+                        break
+                    for record in spooled_records:
+                        left_id = lexical_samples[int(record["left_pos"])]
+                        right_id = lexical_samples[int(record["right_pos"])]
+                        similarity = float(record["similarity"])
+                        left_row, right_row = new_rows[left_id], new_rows[right_id]
+                        virtual_endpoints[virtual_row] = (left_row, right_row)
+                        virtual_similarities[virtual_row] = similarity
+                        virtual_features[virtual_row] = (
+                            node_features[left_row] + node_features[right_row]
+                        ) / 2.0
+                        if left_id in update_row and right_id in label_col:
+                            adjacency_counts[update_row[left_id]] += 1
+                            adjacency_db.execute(
+                                "INSERT INTO adjacency VALUES (?, ?)",
+                                (update_row[left_id], label_col[right_id]),
+                            )
+                        elif right_id in update_row and left_id in label_col:
+                            adjacency_counts[update_row[right_id]] += 1
+                            adjacency_db.execute(
+                                "INSERT INTO adjacency VALUES (?, ?)",
+                                (update_row[right_id], label_col[left_id]),
+                            )
+                        virtual_row += 1
+                        now = monotonic()
+                        if progress_callback is not None and (
+                            virtual_row == 1
+                            or virtual_row % virtual_write_step == 0
+                            or now - last_virtual_write_progress >= 10.0
+                        ):
+                            progress_callback(
+                                f"[pipeline] RSSI pair pass 'write virtual edges': "
+                                f"{virtual_row:,}/{virtual_count:,} relations written "
+                                f"({virtual_row / max(1, virtual_count):.0%}); "
+                                f"elapsed={now - virtual_write_started:.1f}s"
+                            )
+                            last_virtual_write_progress = now
+        if virtual_row != virtual_count:
+            raise ValueError(
+                f"temporary virtual-pair spool contains {virtual_row} records; "
+                f"expected {virtual_count}"
+            )
+        if progress_callback is not None:
+            progress_callback(
+                f"[pipeline] RSSI pair pass 'write virtual edges' complete: "
+                f"{virtual_row:,}/{virtual_count:,} relations; "
+                f"elapsed={monotonic() - virtual_write_started:.1f}s"
+            )
+        shutil.rmtree(virtual_spool_directory)
         adjacency_indptr = _prefix(adjacency_counts)
         np.save(staging / "update_reference_indptr.npy", adjacency_indptr, allow_pickle=False)
         adjacency_cols = _open_array(
@@ -760,30 +1122,6 @@ def build_streaming_online_graph(
             staging / "update_reference_values.npy", "float64", (int(adjacency_counts.sum()),)
         )
         adjacency_cursor = adjacency_indptr[:-1].copy()
-        adjacency_db = sqlite3.connect(staging / "adjacency_sort.sqlite3")
-        adjacency_db.execute(
-            "CREATE TABLE adjacency (update_row INTEGER NOT NULL, ref_col INTEGER NOT NULL, "
-            "PRIMARY KEY(update_row, ref_col)) WITHOUT ROWID"
-        )
-        for row, (_left_pos, _right_pos, left_id, right_id, similarity) in enumerate(
-            item for item in scored_pairs("write virtual edges") if item[4] > virtual_edge_sigma
-        ):
-            left_row, right_row = new_rows[left_id], new_rows[right_id]
-            virtual_endpoints[row] = (left_row, right_row)
-            virtual_similarities[row] = similarity
-            virtual_features[row] = (
-                node_features[left_row] + node_features[right_row]
-            ) / 2.0
-            if left_id in update_row and right_id in label_col:
-                adjacency_db.execute(
-                    "INSERT INTO adjacency VALUES (?, ?)",
-                    (update_row[left_id], label_col[right_id]),
-                )
-            elif right_id in update_row and left_id in label_col:
-                adjacency_db.execute(
-                    "INSERT INTO adjacency VALUES (?, ?)",
-                    (update_row[right_id], label_col[left_id]),
-                )
         adjacency_db.commit()
         for update_index, ref_col in adjacency_db.execute(
             "SELECT update_row, ref_col FROM adjacency ORDER BY update_row, ref_col"
