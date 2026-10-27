@@ -73,6 +73,7 @@ from streaming_transition import (
     apply_streaming_ap_delta_to_reference,
     load_streaming_reference_transition,
     materialize_streaming_reference_prepared,
+    materialize_streaming_post_transition_prepared,
 )
 from streaming_update import (
     StreamingOnlineGraphManifest,
@@ -696,11 +697,6 @@ def _process_batch(
     )
     transitioned_prepared_path = staging / "reference_prepared.json"
     transitioned_provenance_path = staging / "reference_value_provenance.json"
-    save_prepared_dataset(
-        transitioned_prepared,
-        transitioned_prepared_path,
-        value_provenance_path=transitioned_provenance_path,
-    )
     _stage_call(stage_observer, "update_transition_state", staging, records, "reference_transition")
 
     migrated_ae_path = ae_update_path / "updated_ae.pt"
@@ -735,9 +731,18 @@ def _process_batch(
         migrated_ae_path,
         post_transition_ae_path,
         config.fingerprint_update,
+        update_prepared=full_update,
         chunk_size=config.ae_chunk_size,
         device=config.device,
         log_every_epochs=config.log_every_epochs,
+    )
+    transitioned_prepared = materialize_streaming_post_transition_prepared(
+        transitioned_prepared, post_transition_ae
+    )
+    save_prepared_dataset(
+        transitioned_prepared,
+        transitioned_prepared_path,
+        value_provenance_path=transitioned_provenance_path,
     )
     _stage_call(stage_observer, "update_ae_realign", staging, records, "post_transition_ae")
 

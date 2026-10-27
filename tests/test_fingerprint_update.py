@@ -65,6 +65,7 @@ from streaming_gnn import (
 from streaming_transition import (
     apply_streaming_ap_delta_to_reference,
     load_streaming_reference_transition,
+    materialize_streaming_post_transition_prepared,
     materialize_streaming_reference_prepared,
 )
 from streaming_fingerprint_update import (
@@ -1379,7 +1380,8 @@ def test_streaming_online_lp_extension_initializes_new_ap_by_full_identity(
     assert reloaded.manifest.admitted_bssids == (new_bssid,)
     assert reloaded.updated_rssi_dbm.shape == (len(pipeline.reference.scans), 3)
     new_col = reloaded.manifest.vocabulary_after.index(new_bssid)
-    assert np.any(reloaded.value_provenance[:, new_col] == 2)
+    assert np.all(reloaded.value_provenance[:, new_col] == 3)
+    assert np.all(reloaded.updated_rssi_dbm[:, new_col] == -120.0)
     assert not np.any(reloaded.observation_mask[:, new_col])
 
     eq10_checkpoint = load_ae_checkpoint(
@@ -1402,6 +1404,7 @@ def test_streaming_online_lp_extension_initializes_new_ap_by_full_identity(
         migrated.path,
         tmp_path / "new-ap-post-transition-ae",
         update_config,
+        update_prepared=full_update,
         chunk_size=2,
         log_every_epochs=1,
     )
@@ -1410,6 +1413,9 @@ def test_streaming_online_lp_extension_initializes_new_ap_by_full_identity(
     )
     transitioned_prepared = materialize_streaming_reference_prepared(
         pipeline.reference, reloaded
+    )
+    transitioned_prepared = materialize_streaming_post_transition_prepared(
+        transitioned_prepared, reloaded_post_transition_ae
     )
     assert tuple(scan.scan_id for scan in transitioned_prepared.scans) == tuple(
         scan.scan_id for scan in pipeline.reference.scans

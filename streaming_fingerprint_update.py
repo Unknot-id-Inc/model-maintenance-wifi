@@ -1,11 +1,10 @@
-"""Chunked, disk-backed Eq. (5)--(9) updater MLP training.
+"""Chunked, disk-backed streaming updater and AE fine-tuning.
 
 The online GNN feature table and sparse cross-virtual adjacency remain mapped
 on disk. The updater's Frobenius norms are global over each equation, and its
 parameter gradients are accumulated over chunks with the exact derivative of
-those norms. This module does not yet perform Eq. (10) AE fine-tuning or AP
-vocabulary migration; those remain explicit later stages of the streaming
-batch driver.
+those norms. Streaming Eq. (10) AE fine-tuning and AP-vocabulary migration
+are also implemented here as explicit post-update stages.
 """
 
 from __future__ import annotations
@@ -69,7 +68,7 @@ from training_progress import (
 
 STREAM_UPDATER_FORMAT = "gufu_streaming_updater_v1"
 STREAM_AE_UPDATE_FORMAT = "gufu_streaming_ae_update_v1"
-STREAM_POST_TRANSITION_AE_FORMAT = "gufu_streaming_post_transition_ae_v1"
+STREAM_POST_TRANSITION_AE_FORMAT = "gufu_streaming_post_transition_ae_v2"
 
 
 class StreamingUpdaterManifest(BaseModel):
@@ -231,7 +230,7 @@ class StreamingAEUpdateState:
 class StreamingPostTransitionAEManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_post_transition_ae_v1"] = STREAM_POST_TRANSITION_AE_FORMAT
+    format: Literal["gufu_streaming_post_transition_ae_v2"] = STREAM_POST_TRANSITION_AE_FORMAT
     post_update_id: str = Field(pattern=r"^streampostae:[0-9a-f]{64}$")
     transition_id: str = Field(pattern=r"^streamtransition:[0-9a-f]{64}$")
     source_ae_update_id: str = Field(pattern=r"^streamae:[0-9a-f]{64}$")
@@ -241,12 +240,18 @@ class StreamingPostTransitionAEManifest(BaseModel):
     dataset_id: str
     reference_batch_id: str
     update_batch_id: str
+    update_scan_ids: tuple[str, ...]
+    update_signal_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    update_observed_readings: int = Field(gt=0)
     reference_scan_ids: tuple[str, ...]
     original_coordinates: tuple[tuple[float, float] | None, ...]
     labeled_reference_ids: tuple[str, ...]
     bssid_vocabulary: tuple[str, ...]
     vocabulary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     normalization: Literal["paper_ae", "legacy_raw_div_120"]
+    objective: Literal["eq10_reference_anchor_plus_masked_update_rss_v1"] = (
+        "eq10_reference_anchor_plus_masked_update_rss_v1"
+    )
     model_config_record: AEModelConfig
     config: FingerprintUpdateConfig
     loss_history: tuple[tuple[float, float, float], ...]
@@ -255,6 +260,10 @@ class StreamingPostTransitionAEManifest(BaseModel):
 
     @model_validator(mode="after")
     def aligned(self):
+        if not self.update_scan_ids:
+            raise ValueError("post-transition AE requires measured update scans")
+        if len(set(self.update_scan_ids)) != len(self.update_scan_ids):
+            raise ValueError("post-transition AE update scan IDs must be unique")
         if len(self.reference_scan_ids) != len(self.original_coordinates):
             raise ValueError("post-transition AE coordinates must align with reference IDs")
         if self.labeled_reference_ids != tuple(
@@ -1280,11 +1289,15 @@ def load_streaming_ae_update(
     )
 
 
-def _transition_ae_chunk(transition_state, rows: np.ndarray, normalization: str) -> np.ndarray:
+def _transition_ae_chunk(
+    transition_state, rows: np.ndarray, normalization: str
+) -> tuple[np.ndarray, np.ndarray]:
     values = np.asarray(transition_state.updated_rssi_dbm[rows], dtype=np.float64)
     masks = np.asarray(transition_state.observation_mask[rows], dtype=np.uint8)
     origins = np.asarray(transition_state.value_provenance[rows], dtype=np.uint8)
-    usable = (masks != 0) | (origins == 1) | (origins == 2)
+    # Eq. (13) edge scores are graph weights, never AE input or targets.
+    # Prior decoder estimates can be inputs, but only measured RSS is a target.
+    usable = (masks != 0) | (origins == 1)
     matrix = np.empty_like(values, dtype=np.float32)
     for row in range(len(rows)):
         matrix[row] = raw_dbm_row_to_ae(
@@ -1292,7 +1305,39 @@ def _transition_ae_chunk(transition_state, rows: np.ndarray, normalization: str)
             tuple(bool(value) for value in usable[row]),
             normalization,
         )
-    return matrix[:, None, :]
+    return matrix[:, None, :], (masks != 0)[:, None, :].astype(np.float32)
+
+
+def _update_ae_chunk(
+    update_prepared: PreparedDataset,
+    rows: np.ndarray,
+    target_vocabulary: tuple[str, ...],
+    normalization: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map actual update-batch measurements into the expanded AE vocabulary."""
+    source_column = {
+        bssid: column
+        for column, bssid in enumerate(update_prepared.bssid_vocabulary)
+    }
+    target_sources = tuple(
+        (target_column, source_column[bssid])
+        for target_column, bssid in enumerate(target_vocabulary)
+        if bssid in source_column
+    )
+    raw = np.full((len(rows), len(target_vocabulary)), -120.0, dtype=np.float64)
+    observed = np.zeros((len(rows), len(target_vocabulary)), dtype=np.uint8)
+    for output_row, scan_index in enumerate(rows):
+        scan = update_prepared.scans[int(scan_index)]
+        for target_column, source_idx in target_sources:
+            if scan.observation_mask[source_idx]:
+                raw[output_row, target_column] = scan.rss_dbm[source_idx]
+                observed[output_row, target_column] = 1
+    matrix = np.empty_like(raw, dtype=np.float32)
+    for row in range(len(rows)):
+        matrix[row] = raw_dbm_row_to_ae(
+            raw[row], tuple(bool(value) for value in observed[row]), normalization
+        )
+    return matrix[:, None, :], observed[:, None, :].astype(np.float32)
 
 
 def fine_tune_streaming_ae_after_ap_transition(
@@ -1303,18 +1348,21 @@ def fine_tune_streaming_ae_after_ap_transition(
     output_directory: str | Path,
     config: FingerprintUpdateConfig,
     *,
+    update_prepared: PreparedDataset,
     chunk_size: int = 256,
     device: str | torch.device = "cpu",
     log_every_epochs: int = DEFAULT_LOG_EVERY_K_EPOCHS,
 ) -> StreamingPostTransitionAEState:
-    """Run Eq. (10) after AP admission/forgetting and vocabulary migration.
+    """Fine-tune the migrated AE from measured update scans and reference anchors.
 
     AP migration is applied to the trained AE weights before this call. Shared
-    slices and returning AP archives therefore remain real learned state; this
-    stage fine-tunes that migrated model against the transition RSS arrays and
-    the fixed Eq. (9) labeled-reference latent targets. It decodes only the
-    immutable reference IDs, preserves measured masks, and saves a standard
-    AE checkpoint that the next batch can load.
+    slices and returning AP archives therefore remain real learned state. The
+    reconstruction term uses measured RSS from the unlabeled update batch,
+    with missing cells masked out, plus an anchored reference reconstruction
+    term. Eq. (13) scores remain graph weights and are excluded from AE inputs
+    and targets. The fitted decoder fills unavailable values for all retained
+    reference scans, while immutable labeled-reference latent targets remain
+    the Eq. (9) anchor.
     """
     from ae import AECheckpointManifest
 
@@ -1330,6 +1378,17 @@ def fine_tune_streaming_ae_after_ap_transition(
         raise ValueError("AP transition does not descend from the selected Eq. (10) AE result")
     if tm.reference_scan_ids != am.reference_scan_ids or tm.update_scan_ids != am.update_scan_ids:
         raise ValueError("post-transition AE changed scan identities or order")
+    if update_prepared.config.batch_role != "update_batch":
+        raise ValueError("post-transition AE requires the original unlabeled update batch")
+    if update_prepared.config.dataset_id != tm.dataset_id:
+        raise ValueError("post-transition AE update dataset identity differs")
+    if update_prepared.config.batch_id != tm.update_batch_id:
+        raise ValueError("post-transition AE update batch identity differs")
+    update_ids = tuple(scan.scan_id for scan in update_prepared.scans)
+    if update_ids != tm.update_scan_ids or update_ids != am.update_scan_ids or update_ids != um.update_ids:
+        raise ValueError("post-transition AE update scan IDs/order differ from pipeline state")
+    if update_prepared.config.normalization_mode != tm.normalization:
+        raise ValueError("post-transition AE update normalization differs")
     if tm.vocabulary_before != am.bssid_vocabulary:
         raise ValueError("AP transition source vocabulary differs from Eq. (10) checkpoint")
     if tm.reference_scan_ids != um.reference_ids:
@@ -1357,7 +1416,6 @@ def fine_tune_streaming_ae_after_ap_transition(
         raise ValueError("migrated AE checkpoint is incompatible with AP transition lineage")
     if migrated.model.config.latent_dim != um.encoder_feature_dim:
         raise ValueError("migrated AE latent width differs from Eq. (9) targets")
-
     reference_ids = tm.reference_scan_ids
     label_ids = um.labeled_reference_ids
     label_coords = tuple(
@@ -1378,6 +1436,33 @@ def fine_tune_streaming_ae_after_ap_transition(
     )
     if tuple(reference_ids[int(row)] for row in label_rows) != label_ids:
         raise ValueError("post-transition latent targets do not preserve reference order")
+
+    update_source_columns = {
+        bssid: column
+        for column, bssid in enumerate(update_prepared.bssid_vocabulary)
+    }
+    update_target_sources = tuple(
+        (target_column, update_source_columns[bssid])
+        for target_column, bssid in enumerate(tm.vocabulary_after)
+        if bssid in update_source_columns
+    )
+    update_observed_readings = sum(
+        sum(bool(scan.observation_mask[source_column]) for _, source_column in update_target_sources)
+        for scan in update_prepared.scans
+    )
+    if update_observed_readings == 0:
+        raise ValueError(
+            "post-transition AE update batch has no measured RSS in the transitioned vocabulary"
+        )
+    update_signal_sha256 = canonical_json_digest(
+        (
+            update_prepared.bssid_vocabulary,
+            tuple(
+                (scan.scan_id, scan.rss_dbm, scan.observation_mask)
+                for scan in update_prepared.scans
+            ),
+        )
+    )
 
     selected_device = torch.device(device)
     if selected_device.type == "cuda" and not torch.cuda.is_available():
@@ -1409,22 +1494,44 @@ def fine_tune_streaming_ae_after_ap_transition(
             epoch_seed = config.seed + 1303 + epoch
             model.train()
             _seed_ae_pass(epoch_seed, selected_device)
-            squared = np.zeros((3,), dtype=np.float64)
+            squared = np.zeros((4,), dtype=np.float64)
             with torch.no_grad():
                 for start in range(0, len(label_rows), chunk_size):
                     stop = min(start + chunk_size, len(label_rows))
                     rows = label_rows[start:stop]
-                    x = _tensor(
-                        _transition_ae_chunk(transition_state, rows, tm.normalization),
-                        selected_device,
+                    x_values, reconstruction_mask = _transition_ae_chunk(
+                        transition_state, rows, tm.normalization
                     )
+                    x = _tensor(x_values, selected_device)
+                    loss_mask = _tensor(reconstruction_mask, selected_device)
                     z_target = _tensor(label_target_rows[start:stop], selected_device).detach()
                     z, reconstruction = model(x)
                     target_reconstruction = model.D(z_target.unsqueeze(1))
-                    squared[0] += float((reconstruction - x).double().square().sum().cpu())
-                    squared[1] += float((z[:, 0, :] - z_target).double().square().sum().cpu())
-                    squared[2] += float((target_reconstruction - reconstruction).double().square().sum().cpu())
-            norms = np.sqrt(squared)
+                    residual = (reconstruction - x) * loss_mask
+                    squared[0] += float(residual.double().square().sum().cpu())
+                    squared[2] += float((z[:, 0, :] - z_target).double().square().sum().cpu())
+                    squared[3] += float((target_reconstruction - reconstruction).double().square().sum().cpu())
+                for start in range(0, len(update_prepared.scans), chunk_size):
+                    stop = min(start + chunk_size, len(update_prepared.scans))
+                    rows = np.arange(start, stop, dtype=np.int64)
+                    x_values, reconstruction_mask = _update_ae_chunk(
+                        update_prepared, rows, tm.vocabulary_after, tm.normalization
+                    )
+                    x = _tensor(x_values, selected_device)
+                    loss_mask = _tensor(reconstruction_mask, selected_device)
+                    _, reconstruction = model(x)
+                    residual = (reconstruction - x) * loss_mask
+                    squared[1] += float(residual.double().square().sum().cpu())
+            reference_reconstruction_norm = float(np.sqrt(squared[0]))
+            update_reconstruction_norm = float(np.sqrt(squared[1]))
+            norms = np.asarray(
+                (
+                    0.5 * (reference_reconstruction_norm + update_reconstruction_norm),
+                    np.sqrt(squared[2]),
+                    np.sqrt(squared[3]),
+                ),
+                dtype=np.float64,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             model.train()
@@ -1432,21 +1539,36 @@ def fine_tune_streaming_ae_after_ap_transition(
             for start in range(0, len(label_rows), chunk_size):
                 stop = min(start + chunk_size, len(label_rows))
                 rows = label_rows[start:stop]
-                x = _tensor(
-                    _transition_ae_chunk(transition_state, rows, tm.normalization),
-                    selected_device,
+                x_values, reconstruction_mask = _transition_ae_chunk(
+                    transition_state, rows, tm.normalization
                 )
+                x = _tensor(x_values, selected_device)
+                loss_mask = _tensor(reconstruction_mask, selected_device)
                 z_target = _tensor(label_target_rows[start:stop], selected_device).detach()
                 z, reconstruction = model(x)
                 target_reconstruction = model.D(z_target.unsqueeze(1))
                 objective = reconstruction.sum() * 0.0
-                if norms[0] > 0.0:
-                    objective = objective + (reconstruction - x).square().sum() / (2.0 * float(norms[0]))
+                if reference_reconstruction_norm > 0.0:
+                    residual = (reconstruction - x) * loss_mask
+                    objective = objective + 0.5 * residual.square().sum() / reference_reconstruction_norm
                 if norms[1] > 0.0:
                     objective = objective + 0.5 * (z[:, 0, :] - z_target).square().sum() / (2.0 * float(norms[1]))
                 if norms[2] > 0.0:
                     objective = objective + 0.5 * (target_reconstruction - reconstruction).square().sum() / (2.0 * float(norms[2]))
                 objective.backward()
+            for start in range(0, len(update_prepared.scans), chunk_size):
+                stop = min(start + chunk_size, len(update_prepared.scans))
+                rows = np.arange(start, stop, dtype=np.int64)
+                x_values, reconstruction_mask = _update_ae_chunk(
+                    update_prepared, rows, tm.vocabulary_after, tm.normalization
+                )
+                x = _tensor(x_values, selected_device)
+                loss_mask = _tensor(reconstruction_mask, selected_device)
+                _, reconstruction = model(x)
+                if update_reconstruction_norm > 0.0:
+                    residual = (reconstruction - x) * loss_mask
+                    objective = 0.5 * residual.square().sum() / update_reconstruction_norm
+                    objective.backward()
             gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
             if not gradients or any(not torch.isfinite(gradient).all().item() for gradient in gradients):
                 raise FloatingPointError("post-transition Eq. (10) gradients are missing or non-finite")
@@ -1455,14 +1577,18 @@ def fine_tune_streaming_ae_after_ap_transition(
             optimizer.step()
             history.append(tuple(float(value) for value in norms))
             log_training_epoch(
-                "Streaming post-transition AE Eq. (10)",
+                "Streaming post-transition AE Eq. (10) + measured update RSS",
                 epoch,
                 config.ae_epochs,
                 {
-                    "reconstruction_frobenius": float(norms[0]),
+                    "balanced_reconstruction_frobenius": float(norms[0]),
+                    "reference_reconstruction_frobenius": reference_reconstruction_norm,
+                    "update_reconstruction_frobenius": update_reconstruction_norm,
                     "latent_frobenius": float(norms[1]),
                     "decoder_frobenius": float(norms[2]),
                     "labeled_reference_scans": len(label_rows),
+                    "unlabeled_update_scans": len(update_prepared.scans),
+                    "update_observed_rssi_targets": update_observed_readings,
                     "APs": len(tm.vocabulary_after),
                     "chunk_size": chunk_size,
                 },
@@ -1481,17 +1607,42 @@ def fine_tune_streaming_ae_after_ap_transition(
     updated[:] = transition_state.updated_rssi_dbm[:]
     masks[:] = transition_state.observation_mask[:]
     provenance[:] = transition_state.value_provenance[:]
+    label_target_row = {
+        int(reference_row): target_row
+        for target_row, reference_row in enumerate(label_rows)
+    }
     with torch.inference_mode():
-        for start in range(0, len(label_rows), chunk_size):
-            stop = min(start + chunk_size, len(label_rows))
-            z = _tensor(label_target_rows[start:stop], selected_device).unsqueeze(1)
-            normalized = model.D(z)[:, 0, :].cpu().numpy()
-            for offset, row in enumerate(label_rows[start:stop]):
-                updated[int(row)] = np.asarray(
-                    [ae_value_to_raw_dbm(float(value), tm.normalization) for value in normalized[offset]],
+        for start in range(0, n_reference, chunk_size):
+            stop = min(start + chunk_size, n_reference)
+            rows = np.arange(start, stop, dtype=np.int64)
+            x_values, _ = _transition_ae_chunk(
+                transition_state, rows, tm.normalization
+            )
+            x = _tensor(x_values, selected_device)
+            latent = model.E(x)[:, 0, :]
+            for offset, row in enumerate(rows):
+                target_row = label_target_row.get(int(row))
+                if target_row is not None:
+                    latent[offset] = _tensor(
+                        label_target_rows[target_row], selected_device
+                    )
+            normalized = model.D(latent.unsqueeze(1))[:, 0, :].cpu().numpy()
+            for offset, row_value in enumerate(rows):
+                row = int(row_value)
+                decoded = np.asarray(
+                    [
+                        ae_value_to_raw_dbm(float(value), tm.normalization)
+                        for value in normalized[offset]
+                    ],
                     dtype=np.float32,
                 )
-                provenance[int(row), :] = 1
+                if row in label_target_row:
+                    updated[row] = decoded
+                    provenance[row, :] = 1
+                else:
+                    unavailable = np.asarray(masks[row] == 0)
+                    updated[row, unavailable] = decoded[unavailable]
+                    provenance[row, unavailable] = 1
     for array in (updated, masks, provenance):
         if isinstance(array, np.memmap):
             array.flush()
@@ -1585,6 +1736,9 @@ def fine_tune_streaming_ae_after_ap_transition(
         dataset_id=tm.dataset_id,
         reference_batch_id=tm.reference_batch_id,
         update_batch_id=tm.update_batch_id,
+        update_scan_ids=update_ids,
+        update_signal_sha256=update_signal_sha256,
+        update_observed_readings=update_observed_readings,
         reference_scan_ids=reference_ids,
         original_coordinates=tm.original_coordinates,
         labeled_reference_ids=label_ids,
@@ -1654,6 +1808,10 @@ def load_streaming_post_transition_ae(
         if tuple(array.shape) != item.shape or array.dtype.name != item.dtype:
             raise ValueError(f"post-transition AE array shape/dtype mismatch: {item.name}")
         arrays[item.name] = array
+    if np.any(arrays["value_provenance.npy"] == 2):
+        raise ValueError(
+            "post-transition AE artifact contains graph edge scores as RSS provenance"
+        )
     return StreamingPostTransitionAEState(
         directory=root,
         manifest=manifest,

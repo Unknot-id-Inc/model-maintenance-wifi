@@ -1,17 +1,19 @@
-"""Disk-backed application of one streamed AP edge delta to reference RSS.
+"""Disk-backed application of one streamed AP edge delta to a reference graph.
 
 The module consumes streamed score/delta JSONL and mapped edge arrays. It
 retains the original reference scan IDs and coordinates, applies only
 reference-edge changes, derives the post-forgetting vocabulary by full BSSID
 identity, and writes remapped RSS/mask/provenance arrays plus the resulting
-reference radio table. It does not create ``APGraphModification`` or a
-candidate-sized Python edge list.
+reference radio table. Eq. (13) scores stay in the radio table; they are not
+converted into pseudo-RSSI values. It does not create
+``APGraphModification`` or a candidate-sized Python edge list.
 """
 
 from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import sqlite3
 import tempfile
@@ -209,6 +211,92 @@ def materialize_streaming_reference_prepared(
     )
 
 
+def materialize_streaming_post_transition_prepared(
+    reference_prepared: PreparedDataset,
+    post_transition_ae_state,
+) -> PreparedDataset:
+    """Materialize decoder estimates after AP-transition AE fine-tuning.
+
+    The transition's Eq. (13) scores remain in its graph edge table. This
+    prepared-data view contains only measured values and AE decoder estimates;
+    the physical observation mask is preserved separately from provenance.
+    """
+    manifest = post_transition_ae_state.manifest
+    reference_ids = tuple(scan.scan_id for scan in reference_prepared.scans)
+    if reference_ids != manifest.reference_scan_ids:
+        raise ValueError("post-transition AE scan IDs differ from reference data")
+    if reference_prepared.config.dataset_id != manifest.dataset_id:
+        raise ValueError("post-transition AE dataset identity differs from reference data")
+    if reference_prepared.bssid_vocabulary != manifest.bssid_vocabulary:
+        raise ValueError("post-transition AE vocabulary differs from reference data")
+    shape = (len(reference_ids), len(manifest.bssid_vocabulary))
+    if any(
+        array.shape != shape
+        for array in (
+            post_transition_ae_state.updated_rssi_dbm,
+            post_transition_ae_state.observation_mask,
+            post_transition_ae_state.value_provenance,
+        )
+    ):
+        raise ValueError("post-transition AE RSS, masks, and provenance do not align")
+
+    code_to_name = {
+        0: "measured",
+        1: "decoder_prediction",
+        2: "edge_prediction",
+        3: "missing",
+    }
+    scans = []
+    for row, old_scan in enumerate(reference_prepared.scans):
+        scans.append(
+            PreparedScan(
+                timestamp=old_scan.timestamp,
+                scan_id=old_scan.scan_id,
+                dataset_id=old_scan.dataset_id,
+                batch_id=old_scan.batch_id,
+                batch_role=old_scan.batch_role,
+                source=old_scan.source,
+                coordinate_role=old_scan.coordinate_role,
+                has_coordinates=old_scan.has_coordinates,
+                rss_dbm=tuple(
+                    float(value)
+                    for value in post_transition_ae_state.updated_rssi_dbm[row]
+                ),
+                observation_mask=tuple(
+                    bool(value)
+                    for value in post_transition_ae_state.observation_mask[row]
+                ),
+                value_provenance=tuple(
+                    code_to_name[int(value)]
+                    for value in post_transition_ae_state.value_provenance[row]
+                ),
+            )
+        )
+    stats = reference_prepared.stats.model_copy(
+        update={
+            "observed_readings": int(
+                np.asarray(
+                    post_transition_ae_state.observation_mask, dtype=np.uint8
+                ).sum()
+            )
+        }
+    )
+    return PreparedDataset.model_validate(
+        {
+            "schema_version": reference_prepared.schema_version,
+            "config": reference_prepared.config,
+            "bssid_vocabulary": manifest.bssid_vocabulary,
+            "ap_ids": reference_prepared.ap_ids,
+            "scans": tuple(scans),
+            "reference_positions": reference_prepared.reference_positions,
+            "evaluation_positions": (),
+            "source_files": reference_prepared.source_files,
+            "dropped_records": reference_prepared.dropped_records,
+            "stats": stats,
+        }
+    )
+
+
 def _open_array(path: Path, dtype, shape: tuple[int, ...]) -> np.ndarray:
     if not np.prod(shape, dtype=np.int64):
         array = np.empty(shape, dtype=dtype)
@@ -240,11 +328,12 @@ def apply_streaming_ap_delta_to_reference(
     """Apply streamed AP removals/additions and remap reference RSS by BSSID.
 
     ``ae_update`` is the Eq. (10) result before AP topology/vocabulary
-    transition. For old APs its decoded values are retained; added reference
-    edges write ``predicted RSS+120 - 120`` with false measured masks and
-    ``edge_prediction`` provenance. New/returning APs enter vocabulary only
-    when the streamed edge rule admits at least one reference edge, matching
-    the audited ``classify_and_plan_ap_vocabulary`` policy.
+    transition. For old APs its decoded values are retained. Eq. (13) scores
+    are stored only as graph edge weights; new/returning APs enter vocabulary
+    only when the streamed edge rule admits at least one reference edge,
+    matching the audited ``classify_and_plan_ap_vocabulary`` policy. The
+    post-transition AE learns from measured update-batch RSS and estimates
+    unavailable reference values through its decoder.
     """
     base, _ = load_streaming_lp_input(bootstrap_lp_input_directory)
     base_lp = load_streaming_lp_result(
@@ -287,7 +376,13 @@ def apply_streaming_ap_delta_to_reference(
         raise ValueError("AP transition scores use a different learned GNN checkpoint")
     candidate_digest = hashlib.sha256()
     observed_candidate_count = 0
+    maximum_graph_edge_weight = float(transition_lp.manifest.radio_weight_max)
     for score in transition_lp.iter_candidate_scores():
+        if score.predicted_weight > maximum_graph_edge_weight + 1e-9:
+            raise ValueError(
+                "AP transition contains a graph score outside its bounded radio scale; "
+                "rerun link prediction with the recorded graph-weight policy"
+            )
         candidate_digest.update(
             score.sample_node_id.encode("utf-8")
             + b"\0"
@@ -351,6 +446,15 @@ def apply_streaming_ap_delta_to_reference(
         for change in transition_lp.iter_added_edges():
             if change.sample_node_id not in reference_set or change.new_weight is None:
                 raise ValueError("AP transition attempted to add an invalid reference edge")
+            if (
+                not math.isfinite(change.new_weight)
+                or change.new_weight < 0.0
+                or change.new_weight > maximum_graph_edge_weight + 1e-9
+            ):
+                raise ValueError(
+                    "AP transition edge weight is outside its bounded graph scale; "
+                    "rerun link prediction with the recorded graph-weight policy"
+                )
             if change.ap_node_id not in transition_input.ap_node_ids:
                 raise ValueError("AP transition addition references an absent AP node")
             bssid = change.ap_node_id.removeprefix("ap:")
@@ -388,9 +492,7 @@ def apply_streaming_ap_delta_to_reference(
         if len(set(target_vocabulary)) != len(target_vocabulary):
             raise ValueError("streamed transition created duplicate target AP identities")
 
-        reference_row = {scan_id: row for row, scan_id in enumerate(reference_ids)}
         old_column = {bssid: col for col, bssid in enumerate(current_vocabulary)}
-        target_column = {bssid: col for col, bssid in enumerate(target_vocabulary)}
         updated = _open_array(
             staging / "updated_rssi_dbm.npy", np.float32,
             (len(reference_ids), len(target_vocabulary)),
@@ -421,15 +523,6 @@ def apply_streaming_ap_delta_to_reference(
                 else:
                     provenance[row, target_col] = 3
 
-        for change in transition_lp.iter_added_edges():
-            bssid = change.ap_node_id.removeprefix("ap:")
-            target_col = target_column.get(bssid)
-            if target_col is None:
-                raise ValueError("admitted edge AP is absent from the planned vocabulary")
-            row = reference_row[change.sample_node_id]
-            updated[row, target_col] = float(change.new_weight) - 120.0
-            masks[row, target_col] = 0
-            provenance[row, target_col] = 2
         for array in (updated, masks, provenance):
             if isinstance(array, np.memmap):
                 array.flush()
@@ -559,4 +652,6 @@ __all__ = [
     "StreamingReferenceTransitionState",
     "apply_streaming_ap_delta_to_reference",
     "load_streaming_reference_transition",
+    "materialize_streaming_post_transition_prepared",
+    "materialize_streaming_reference_prepared",
 ]

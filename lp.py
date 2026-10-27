@@ -52,6 +52,9 @@ class LinkPredictionConfig(BaseModel):
     iteration_weight_policy: Literal["radio_normalized_plus_virtual_cosine_v1"] = (
         "radio_normalized_plus_virtual_cosine_v1"
     )
+    predicted_radio_weight_policy: Literal[
+        "saturate_at_observed_max_v1"
+    ] = "saturate_at_observed_max_v1"
     isolated_node_policy: Literal["keep_initial_g_f"] = "keep_initial_g_f"
     zero_radio_weight_policy: Literal["normalized_zero_and_zero_score_scale"] = (
         "normalized_zero_and_zero_score_scale"
@@ -109,6 +112,11 @@ class FeatureTablePrediction(BaseModel):
             raise ValueError("feature-table prediction state must be finite")
         if self.outcome == "failed" and self.scores:
             raise ValueError("failed feature-table prediction cannot expose edge scores")
+        if any(
+            score.predicted_weight > self.radio_weight_max + 1e-9
+            for score in self.scores
+        ):
+            raise ValueError("predicted graph weights exceed the observed radio scale")
         return self
 
 
@@ -411,6 +419,11 @@ class EdgeDelta(BaseModel):
             (score.sample_node_id, score.ap_node_id): score
             for score in self.candidate_scores
         }
+        if any(
+            score.predicted_weight > self.radio_weight_max + 1e-9
+            for score in self.candidate_scores
+        ):
+            raise ValueError("predicted graph weights exceed the observed radio scale")
         for change in self.added_edges:
             if change.old_weight is not None or change.new_weight is None:
                 raise ValueError("added edge must have only a new weight")
@@ -733,7 +746,32 @@ def _predicted_weight(
         fairness[sample_row][index] * goodness[ap_row][index]
         for index in range(len(goodness[sample_row]))
     )
-    return radio_weight_max * (left + right) / 2.0
+    return _bounded_predicted_radio_weight(left, right, radio_weight_max)
+
+
+def _bounded_predicted_radio_weight(
+    left_score: float, right_score: float, radio_weight_max: float
+) -> float:
+    """Convert the symmetrized G/F score to a bounded graph edge weight.
+
+    The raw dot-product score is unbounded, while downstream graph and
+    propagation scales are tied to observed radio weights. Preserve scores
+    within that scale and saturate positive outliers at its maximum. This is a
+    graph stability bound; the resulting weight is not converted into an RSS
+    measurement or supplied to the AE. Negative scores remain below any
+    configured nonnegative edge threshold and are never stored as edges.
+    """
+    if not all(
+        math.isfinite(value)
+        for value in (left_score, right_score, radio_weight_max)
+    ):
+        raise LinkPredictionError("predicted radio score inputs must be finite")
+    if radio_weight_max < 0.0:
+        raise LinkPredictionError("maximum observed radio weight cannot be negative")
+    raw_weight = radio_weight_max * (left_score + right_score) / 2.0
+    if not math.isfinite(raw_weight):
+        raise LinkPredictionError("predicted radio weight is non-finite")
+    return min(raw_weight, radio_weight_max)
 
 
 def score_candidate_pairs_from_features(

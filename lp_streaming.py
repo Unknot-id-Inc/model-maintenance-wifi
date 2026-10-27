@@ -33,6 +33,7 @@ from lp import (
     CandidateEdgeScore,
     LinkEdgeChange,
     LinkPredictionConfig,
+    _bounded_predicted_radio_weight,
     _validate_inputs,
 )
 from sage_ve import GNNFeatureArtifact
@@ -1427,7 +1428,9 @@ def predict_edges_streaming(
                         float(sample_f[column]) * float(ap_g[column])
                         for column in range(input_manifest.node_feature_dim)
                     )
-                    predicted = input_manifest.radio_weight_max * (left + right) / 2.0
+                    predicted = _bounded_predicted_radio_weight(
+                        left, right, input_manifest.radio_weight_max
+                    )
                     score = CandidateEdgeScore(
                         edge_id=f"radio:{sample_id}|{ap_id}",
                         sample_node_id=sample_id,
