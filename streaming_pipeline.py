@@ -86,8 +86,8 @@ from streaming_update import (
 from training_progress import DEFAULT_LOG_EVERY_K_EPOCHS, validate_log_interval
 
 
-PIPELINE_FORMAT = "gufu_streaming_pipeline_v1"
-SNAPSHOT_FORMAT = "gufu_streaming_batch_snapshot_v1"
+PIPELINE_FORMAT = "gufu_streaming_pipeline_v2"
+SNAPSHOT_FORMAT = "gufu_streaming_batch_snapshot_v2"
 
 
 class StreamingPipelineConfig(BaseModel):
@@ -155,7 +155,7 @@ class SnapshotCurrentState(BaseModel):
 class StreamingBatchSnapshotManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_batch_snapshot_v1"] = SNAPSHOT_FORMAT
+    format: Literal["gufu_streaming_batch_snapshot_v2"] = SNAPSHOT_FORMAT
     snapshot_id: str = Field(pattern=r"^streambatch:[0-9a-f]{64}$")
     sequence_number: int = Field(ge=1)
     parent_snapshot_id: str | None = Field(

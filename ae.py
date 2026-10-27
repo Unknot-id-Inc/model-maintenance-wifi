@@ -181,7 +181,8 @@ class AEVocabularyMigrationRecord(BaseModel):
         "copy_shared_by_bssid_restore_tombstone_or_seed_new_ap_slices_v1"
     ] = "copy_shared_by_bssid_restore_tombstone_or_seed_new_ap_slices_v1"
     optimizer_policy: Literal[
-        "reset_resized_tensor_state_preserve_unaffected_adam_state_v1"
+        "reset_resized_tensor_state_preserve_unaffected_adam_state_v1",
+        "reset_all_adam_state_after_vocabulary_transition_v1",
     ] = "reset_resized_tensor_state_preserve_unaffected_adam_state_v1"
 
     @model_validator(mode="after")

@@ -67,8 +67,8 @@ from training_progress import (
 
 
 STREAM_UPDATER_FORMAT = "gufu_streaming_updater_v1"
-STREAM_AE_UPDATE_FORMAT = "gufu_streaming_ae_update_v1"
-STREAM_POST_TRANSITION_AE_FORMAT = "gufu_streaming_post_transition_ae_v2"
+STREAM_AE_UPDATE_FORMAT = "gufu_streaming_ae_update_v2"
+STREAM_POST_TRANSITION_AE_FORMAT = "gufu_streaming_post_transition_ae_v3"
 
 
 class StreamingUpdaterManifest(BaseModel):
@@ -156,7 +156,7 @@ class StreamingUpdaterState:
 class StreamingAEUpdateManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_ae_update_v1"] = STREAM_AE_UPDATE_FORMAT
+    format: Literal["gufu_streaming_ae_update_v2"] = STREAM_AE_UPDATE_FORMAT
     update_id: str = Field(pattern=r"^streamae:[0-9a-f]{64}$")
     updater_id: str = Field(pattern=r"^streamupdater:[0-9a-f]{64}$")
     online_graph_id: str = Field(pattern=r"^onlinegraph:[0-9a-f]{64}$")
@@ -230,7 +230,7 @@ class StreamingAEUpdateState:
 class StreamingPostTransitionAEManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_post_transition_ae_v2"] = STREAM_POST_TRANSITION_AE_FORMAT
+    format: Literal["gufu_streaming_post_transition_ae_v3"] = STREAM_POST_TRANSITION_AE_FORMAT
     post_update_id: str = Field(pattern=r"^streampostae:[0-9a-f]{64}$")
     transition_id: str = Field(pattern=r"^streamtransition:[0-9a-f]{64}$")
     source_ae_update_id: str = Field(pattern=r"^streamae:[0-9a-f]{64}$")
@@ -1078,20 +1078,38 @@ def train_streaming_ae_update(
             scan = scan_by_id[scan_id]
             source_rss[ref_row] = np.asarray(scan.rss_dbm, dtype=np.float32)
             masks[ref_row] = np.asarray(scan.observation_mask, dtype=np.uint8)
+            observed = masks[ref_row].astype(bool)
             if scan_id not in label_row:
                 updated[ref_row] = source_rss[ref_row]
-                provenance[ref_row] = 0
+                if scan.value_provenance is None:
+                    provenance[ref_row] = np.where(observed, 0, 3)
+                else:
+                    provenance_codes = {
+                        "measured": 0,
+                        "decoder_prediction": 1,
+                        "edge_prediction": 2,
+                        "missing": 3,
+                    }
+                    provenance[ref_row] = np.asarray(
+                        [provenance_codes[value] for value in scan.value_provenance],
+                        dtype=np.uint8,
+                    )
                 continue
             latent = _tensor(
                 updater_state.updated_reference_latents[label_row[scan_id] : label_row[scan_id] + 1],
                 selected_device,
             )
             normalized = model.D(latent.unsqueeze(1))[0, 0].cpu().numpy()
-            updated[ref_row] = np.asarray(
+            decoded = np.asarray(
                 [ae_value_to_raw_dbm(float(value), rm.normalization) for value in normalized],
                 dtype=np.float32,
             )
-            provenance[ref_row] = 1
+            # Decode only unobserved cells; measured RSS remains the target
+            # passed to the AP transition and subsequent AE training.
+            updated[ref_row] = source_rss[ref_row]
+            unavailable = ~observed
+            updated[ref_row, unavailable] = decoded[unavailable]
+            provenance[ref_row] = np.where(observed, 0, 1)
     for array in (updated, source_rss, masks, provenance):
         if isinstance(array, np.memmap):
             array.flush()
@@ -1476,10 +1494,8 @@ def fine_tune_streaming_ae_after_ap_transition(
     optimizer = torch.optim.Adam(
         model.parameters(), lr=config.ae_learning_rate, weight_decay=config.ae_weight_decay
     )
-    optimizer.load_state_dict(migrated.optimizer_state)
-    for group in optimizer.param_groups:
-        group["lr"] = config.ae_learning_rate
-        group["weight_decay"] = config.ae_weight_decay
+    # AP migration changes the model's input/output layout and this fine-tune
+    # uses a different training context. Do not carry stale Adam moments over.
 
     target = Path(output_directory)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1636,13 +1652,10 @@ def fine_tune_streaming_ae_after_ap_transition(
                     ],
                     dtype=np.float32,
                 )
-                if row in label_target_row:
-                    updated[row] = decoded
-                    provenance[row, :] = 1
-                else:
-                    unavailable = np.asarray(masks[row] == 0)
-                    updated[row, unavailable] = decoded[unavailable]
-                    provenance[row, unavailable] = 1
+                unavailable = np.asarray(masks[row] == 0)
+                updated[row, unavailable] = decoded[unavailable]
+                provenance[row, masks[row] != 0] = 0
+                provenance[row, unavailable] = 1
     for array in (updated, masks, provenance):
         if isinstance(array, np.memmap):
             array.flush()
@@ -1682,6 +1695,7 @@ def fine_tune_streaming_ae_after_ap_transition(
     updated_migration = migration.model_copy(
         update={
             "transition_batch_id": tm.update_batch_id,
+            "optimizer_policy": "reset_all_adam_state_after_vocabulary_transition_v1",
             "finetune_epochs": len(history),
             "finetune_seed": config.seed + 1303,
             "finetune_loss_history": total_history,

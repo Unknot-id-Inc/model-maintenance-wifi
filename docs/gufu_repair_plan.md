@@ -1154,7 +1154,10 @@ driver. For each batch it:
 6. Migrates the trained AE by BSSID identity (including archived returning AP
    columns), fine-tunes it with measured RSS from unlabeled update scans using
    a mask-aware reconstruction term and labeled-reference latent anchors, then
-   decodes unavailable reference RSS values. It rebuilds a persistent
+   decodes only unavailable reference RSS values while preserving measured
+   reference cells. The post-transition fine-tune starts with fresh Adam
+   moments because its objective/data differ from the preceding Eq. (10) run.
+   It rebuilds a persistent
    reference-only graph, and trains/exports its next GNN state from the
    preceding online GNN weights with a fresh batch optimizer.
 7. Writes the new LP input for the next batch. Temporary update samples and

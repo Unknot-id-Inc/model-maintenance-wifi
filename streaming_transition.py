@@ -41,7 +41,7 @@ from lp_streaming import (
 from streaming_fingerprint_update import StreamingAEUpdateState
 
 
-STREAMING_TRANSITION_FORMAT = "gufu_streaming_reference_transition_v1"
+STREAMING_TRANSITION_FORMAT = "gufu_streaming_reference_transition_v2"
 
 
 class StreamingFileArtifact(BaseModel):
@@ -55,7 +55,7 @@ class StreamingFileArtifact(BaseModel):
 class StreamingReferenceTransitionManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_reference_transition_v1"] = STREAMING_TRANSITION_FORMAT
+    format: Literal["gufu_streaming_reference_transition_v2"] = STREAMING_TRANSITION_FORMAT
     transition_id: str = Field(pattern=r"^streamtransition:[0-9a-f]{64}$")
     parent_graph_id: str
     parent_lp_result_id: str

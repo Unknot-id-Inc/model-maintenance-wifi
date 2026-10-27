@@ -300,7 +300,7 @@ else:
     PIPELINE_OUTPUT_ROOT = Path("output") / "pipelines" / DATASET_ID / RUN_ID
 PIPELINE_RESUME = True
 
-RUN_EVALUATION = False  # Evaluation is an optional, post-update cell 9 action.
+RUN_EVALUATION = True  # Evaluation is an optional, post-update cell 9 action.
 print(f"Profile={DATA_PROFILE}; mode={RUN_MODE}; device={DEVICE}; seed={SEED}")
 print(f"Bootstrap AE training objective={AE_LOSS}")
 print(
@@ -1153,11 +1153,14 @@ else:
 
 from fingerprint_update import load_updated_fingerprints
 from gufu_data import load_prepared_dataset
+from gufu_artifacts import atomic_write_bytes, sha256_file
 from gufu_evaluation import (
+    compare_streamed_localization_predictions,
     evaluate_measured_reference_rssi,
     evaluate_streamed_reference_rssi,
     evaluate_streamed_update_localization,
     evaluate_update_localization,
+    train_reference_location_mlp_predictions,
 )
 
 if RUN_MODE == "lp_streaming":
@@ -1166,7 +1169,23 @@ if RUN_MODE == "lp_streaming":
     elif pipeline_result.latest_snapshot is None:
         print("No completed update snapshot is available to evaluate.")
     else:
+        import csv
+        import io
         import json
+        import tempfile
+
+        from ae import encode_prepared_dataset
+        from batch_transition import project_prepared_batch_to_vocabulary
+        from lp_streaming import predict_edges_streaming
+        from streaming_gnn import (
+            infer_streaming_gnn_checkpoint_embeddings,
+            infer_streaming_gnn_embeddings,
+            load_streaming_gnn_state,
+        )
+        from streaming_update import (
+            build_streaming_online_graph,
+            load_streaming_online_graph,
+        )
 
         latest = pipeline_result.latest_snapshot
         snapshot_root = pipeline_result.latest_snapshot_directory
@@ -1184,17 +1203,259 @@ if RUN_MODE == "lp_streaming":
         assert tuple(updater_manifest["update_ids"]) == tuple(
             scan.scan_id for scan in evaluation_batch.scans
         )
-        localization_metric = evaluate_streamed_update_localization(
-            tuple(updater_manifest["update_ids"]),
-            predicted_locations,
-            evaluation_batch.evaluation_positions,
-        )
-        print(
-            "Held-out localization (estimator="
-            f"{localization_metric.estimator}): n={localization_metric.paired_scans}, "
-            f"2-D RMSE={localization_metric.rmse:.6g} "
-            f"{localization_metric.coordinate_units}"
-        )
+        if not evaluation_batch.evaluation_positions:
+            print("No held-out coordinate labels; localization comparison was not computed.")
+        else:
+            update_ids = tuple(updater_manifest["update_ids"])
+            updater_stage_metric = evaluate_streamed_update_localization(
+                update_ids,
+                predicted_locations,
+                evaluation_batch.evaluation_positions,
+            )
+
+            # Original side: use the source GNN and original online graph built
+            # from the pre-transition reference fingerprints. Updated side:
+            # rebuild the same incoming scans against the transitioned AE,
+            # vocabulary, reference graph, and final GNN.
+            original_graph_directory = snapshot_root / "online_graph"
+            original_graph = load_streaming_online_graph(original_graph_directory)
+            original_gnn_state = load_streaming_gnn_state(
+                snapshot_root / "online_gnn",
+                original_graph_directory,
+                device=DEVICE,
+            )
+            original_row = {
+                node_id: row
+                for row, node_id in enumerate(original_graph.manifest.node_ids)
+            }
+            original_reference_ids = original_graph.manifest.labeled_reference_ids
+            original_update_ids = original_graph.manifest.update_sample_ids
+            if original_update_ids != update_ids:
+                raise ValueError("original fingerprint graph update IDs differ from evaluation batch")
+            original_reference_embeddings = np.asarray(
+                original_graph.node_features[
+                    [original_row[scan_id] for scan_id in original_reference_ids]
+                ],
+                dtype=np.float32,
+            )
+            original_query_rows = [original_row[scan_id] for scan_id in update_ids]
+
+            source_gnn_checkpoint = snapshot_root / "source_gnn_checkpoint.pt"
+            original_query_embeddings = infer_streaming_gnn_checkpoint_embeddings(
+                original_graph_directory,
+                source_gnn_checkpoint,
+                original_gnn_state.manifest.model_config_record,
+                original_query_rows,
+                expected_checkpoint_sha256=(
+                    original_gnn_state.manifest.source_gnn_checkpoint_sha256
+                ),
+                chunk_size=latest.pipeline_config.gnn_chunk_size,
+                device=DEVICE,
+                temporary_parent=PIPELINE_OUTPUT_ROOT,
+            )
+
+            updated_reference_prepared = load_prepared_dataset(
+                snapshot_root / latest.current_state.reference_prepared,
+                value_provenance_path=(
+                    snapshot_root / latest.current_state.reference_value_provenance
+                ),
+            )
+            updated_reference_graph_directory = (
+                snapshot_root / latest.current_state.reference_graph
+            )
+            updated_reference_graph = load_streaming_online_graph(
+                updated_reference_graph_directory
+            )
+            if (
+                canonical_json_digest(updated_reference_prepared)
+                != updated_reference_graph.manifest.reference_prepared_sha256
+            ):
+                raise ValueError("updated reference graph differs from its prepared fingerprints")
+            updated_reference_gnn = load_streaming_gnn_state(
+                snapshot_root / latest.current_state.reference_gnn,
+                updated_reference_graph_directory,
+                device=DEVICE,
+            )
+            updated_reference_row = {
+                node_id: row
+                for row, node_id in enumerate(updated_reference_gnn.manifest.node_ids)
+            }
+            updated_reference_ids = updated_reference_graph.manifest.labeled_reference_ids
+            original_coordinates_by_id = dict(
+                zip(
+                    original_reference_ids,
+                    original_graph.manifest.labeled_reference_coordinates,
+                )
+            )
+            updated_coordinates_by_id = dict(
+                zip(
+                    updated_reference_ids,
+                    updated_reference_graph.manifest.labeled_reference_coordinates,
+                )
+            )
+            if original_coordinates_by_id != updated_coordinates_by_id:
+                raise ValueError("bootstrap localization labels changed across fingerprint transition")
+            reference_coordinates = np.asarray(
+                [original_coordinates_by_id[scan_id] for scan_id in original_reference_ids],
+                dtype=np.float32,
+            )
+            updated_reference_coordinates = np.asarray(
+                [updated_coordinates_by_id[scan_id] for scan_id in updated_reference_ids],
+                dtype=np.float32,
+            )
+            updated_reference_embeddings = np.asarray(
+                updated_reference_gnn.node_embeddings[
+                    [updated_reference_row[scan_id] for scan_id in updated_reference_ids]
+                ],
+                dtype=np.float32,
+            )
+
+            with tempfile.TemporaryDirectory(
+                prefix="gufu-localization-evaluation-",
+                dir=PIPELINE_OUTPUT_ROOT,
+            ) as evaluation_temp_name:
+                evaluation_temp = Path(evaluation_temp_name)
+                updated_query_prepared = project_prepared_batch_to_vocabulary(
+                    evaluation_batch, tuple(latest.vocabulary_after)
+                )
+                updated_query_encoder = encode_prepared_dataset(
+                    updated_query_prepared,
+                    snapshot_root / latest.current_state.ae_checkpoint,
+                    evaluation_temp / "updated_query_encoder.json",
+                    batch_size=latest.pipeline_config.encoder_batch_size,
+                    device=DEVICE,
+                )
+                updated_lp_result_directory = evaluation_temp / "updated_reference_lp_result"
+                predict_edges_streaming(
+                    snapshot_root / latest.current_state.reference_lp_input,
+                    updated_lp_result_directory,
+                    latest.pipeline_config.link_prediction,
+                    progress_callback=_report_pipeline_progress,
+                )
+                updated_query_graph_directory = evaluation_temp / "updated_query_graph"
+                build_streaming_online_graph(
+                    snapshot_root / latest.current_state.reference_lp_input,
+                    updated_lp_result_directory,
+                    updated_query_prepared,
+                    updated_query_encoder,
+                    updated_query_graph_directory,
+                    virtual_edge_sigma=latest.pipeline_config.graph_build.virtual_edge_sigma,
+                    num_workers=latest.pipeline_config.rssi_pair_num_workers,
+                    progress_callback=_report_pipeline_progress,
+                )
+                updated_query_graph = load_streaming_online_graph(
+                    updated_query_graph_directory
+                )
+                updated_query_row = {
+                    node_id: row
+                    for row, node_id in enumerate(updated_query_graph.manifest.node_ids)
+                }
+                if updated_query_graph.manifest.update_sample_ids != update_ids:
+                    raise ValueError("updated fingerprint graph update IDs differ from evaluation batch")
+                updated_vocabulary_size = len(updated_query_graph.manifest.bssid_vocabulary)
+                updated_vocabulary_sha256 = updated_query_graph.manifest.vocabulary_sha256
+                updated_query_embeddings = infer_streaming_gnn_embeddings(
+                    updated_query_graph_directory,
+                    updated_reference_gnn.model,
+                    [updated_query_row[scan_id] for scan_id in update_ids],
+                    chunk_size=latest.pipeline_config.gnn_chunk_size,
+                    device=DEVICE,
+                    temporary_parent=PIPELINE_OUTPUT_ROOT,
+                )
+
+            localization_config = latest.pipeline_config.fingerprint_update
+            original_predictions = train_reference_location_mlp_predictions(
+                original_reference_embeddings,
+                reference_coordinates,
+                original_query_embeddings,
+                hidden_dim=localization_config.hidden_dim,
+                epochs=localization_config.updater_epochs,
+                learning_rate=localization_config.updater_learning_rate,
+                seed=localization_config.seed,
+                device=DEVICE,
+            )
+            updated_predictions = train_reference_location_mlp_predictions(
+                updated_reference_embeddings,
+                updated_reference_coordinates,
+                updated_query_embeddings,
+                hidden_dim=localization_config.hidden_dim,
+                epochs=localization_config.updater_epochs,
+                learning_rate=localization_config.updater_learning_rate,
+                seed=localization_config.seed,
+                device=DEVICE,
+            )
+            localization_comparison = compare_streamed_localization_predictions(
+                update_ids,
+                original_predictions,
+                updated_predictions,
+                evaluation_batch.evaluation_positions,
+                original_estimator="reference_only_location_mlp_on_original_fingerprints",
+                updated_estimator="reference_only_location_mlp_on_transitioned_fingerprints",
+            )
+            report = {
+                "snapshot_id": latest.snapshot_id,
+                "batch_id": latest.batch_id,
+                "source_gnn_checkpoint_sha256": sha256_file(source_gnn_checkpoint),
+                "updated_gnn_checkpoint_sha256": updated_reference_gnn.manifest.checkpoint_sha256,
+                "source_ae_checkpoint_sha256": latest.source_ae_checkpoint_sha256,
+                "updated_ae_checkpoint_sha256": latest.resulting_ae_checkpoint_sha256,
+                "original_vocabulary_size": len(original_graph.manifest.bssid_vocabulary),
+                "original_vocabulary_sha256": original_graph.manifest.vocabulary_sha256,
+                "updated_vocabulary_size": updated_vocabulary_size,
+                "updated_vocabulary_sha256": updated_vocabulary_sha256,
+                "localization_mlp_training": {
+                    "training_data": "immutable labeled bootstrap reference coordinates",
+                    "objective": "scaled-coordinate Frobenius norm",
+                    "hidden_dim": localization_config.hidden_dim,
+                    "epochs": localization_config.updater_epochs,
+                    "learning_rate": localization_config.updater_learning_rate,
+                    "seed": localization_config.seed,
+                    "held_out_coordinates_used_for_training": False,
+                },
+                "updater_stage_diagnostic": updater_stage_metric.model_dump(mode="json"),
+                "paired_comparison": localization_comparison,
+            }
+            report_directory = (
+                PIPELINE_OUTPUT_ROOT / "evaluation" / latest.snapshot_id.split(":", 1)[1]
+            )
+            atomic_write_json(
+                report,
+                report_directory / "localization_comparison.json",
+                overwrite=True,
+            )
+            csv_buffer = io.StringIO(newline="")
+            per_scan_rows = localization_comparison["per_scan"]
+            writer = csv.DictWriter(csv_buffer, fieldnames=tuple(per_scan_rows[0]))
+            writer.writeheader()
+            writer.writerows(per_scan_rows)
+            atomic_write_bytes(
+                report_directory / "localization_comparison_per_scan.csv",
+                csv_buffer.getvalue().encode("utf-8"),
+                overwrite=True,
+            )
+            rmse_change = localization_comparison["rmse_change_percent"]
+            rmse_change_display = (
+                "undefined" if rmse_change is None else f"{rmse_change:.3g}%"
+            )
+            print(
+                "Paired held-out localization (same scans, same labeled reference set): "
+                f"original 2-D RMSE={localization_comparison['original_2d_rmse']:.6g}, "
+                f"updated 2-D RMSE={localization_comparison['updated_2d_rmse']:.6g} "
+                f"{localization_comparison['coordinate_units']}; "
+                f"change={rmse_change_display} "
+                f"(improved={localization_comparison['scans_improved']}, "
+                f"worsened={localization_comparison['scans_worsened']})"
+            )
+            print(
+                "Updater-stage location MLP diagnostic: "
+                f"2-D RMSE={updater_stage_metric.rmse:.6g} "
+                f"{updater_stage_metric.coordinate_units}; "
+                f"n={updater_stage_metric.paired_scans}"
+            )
+            print(
+                "Per-scan localization comparison saved to "
+                f"{report_directory / 'localization_comparison_per_scan.csv'}"
+            )
         before_provenance_path = (
             snapshot_root / "reference_value_provenance_before.json"
         )

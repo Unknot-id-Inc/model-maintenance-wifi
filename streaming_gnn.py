@@ -950,6 +950,79 @@ def _stream_inference(
     return node_path, radio_path
 
 
+def infer_streaming_gnn_embeddings(
+    graph_directory: str | Path,
+    model: EdgeFeatureSAGE,
+    node_rows: np.ndarray | tuple[int, ...] | list[int],
+    *,
+    chunk_size: int = 4096,
+    device: str | torch.device = "cpu",
+    temporary_parent: str | Path | None = None,
+) -> np.ndarray:
+    """Infer selected node rows, keeping full-graph intermediate arrays temporary."""
+    if chunk_size < 1:
+        raise ValueError("streaming GNN inference chunk_size must be positive")
+    graph = load_streaming_online_graph(graph_directory)
+    if model.config.graph_feature_dim != graph.manifest.node_feature_dim:
+        raise ValueError("streaming GNN inference model width differs from graph features")
+    rows = np.asarray(node_rows, dtype=np.int64)
+    if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= len(graph.manifest.node_ids)):
+        raise ValueError("streaming GNN inference rows are outside the graph")
+    selected_device = torch.device(device)
+    if selected_device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError(f"requested CUDA device is unavailable: {selected_device}")
+    model = model.to(device=selected_device, dtype=torch.float32).eval()
+    parent = None if temporary_parent is None else Path(temporary_parent)
+    if parent is not None:
+        parent.mkdir(parents=True, exist_ok=True)
+    temporary_directory = Path(
+        tempfile.mkdtemp(prefix="gufu-gnn-inference-", dir=parent)
+    )
+    try:
+        node_path, _radio_path = _stream_inference(
+            graph, model, temporary_directory, chunk_size=chunk_size
+        )
+        embeddings = np.load(node_path, mmap_mode="r", allow_pickle=False)
+        return np.asarray(embeddings[rows], dtype=np.float32).copy()
+    finally:
+        shutil.rmtree(temporary_directory, ignore_errors=True)
+
+
+def infer_streaming_gnn_checkpoint_embeddings(
+    graph_directory: str | Path,
+    checkpoint_path: str | Path,
+    model_config: GNNModelConfig,
+    node_rows: np.ndarray | tuple[int, ...] | list[int],
+    *,
+    expected_checkpoint_sha256: str,
+    chunk_size: int = 4096,
+    device: str | torch.device = "cpu",
+    temporary_parent: str | Path | None = None,
+) -> np.ndarray:
+    """Run a saved standard or streamed GNN checkpoint over a streamed graph."""
+    checkpoint = Path(checkpoint_path)
+    if not checkpoint.is_file() or sha256_file(checkpoint) != expected_checkpoint_sha256:
+        raise ValueError("GNN evaluation checkpoint is missing or has unexpected provenance")
+    payload = load_torch_state(checkpoint, map_location="cpu")
+    if set(payload) == {"state_dict"} and isinstance(payload["state_dict"], dict):
+        state_dict = payload["state_dict"]
+    elif isinstance(payload.get("model_state"), dict):
+        state_dict = payload["model_state"]
+    else:
+        raise ValueError("GNN evaluation checkpoint has an unsupported payload")
+    model = EdgeFeatureSAGE(model_config)
+    model.load_state_dict(state_dict, strict=True)
+    model._inference_only = True
+    return infer_streaming_gnn_embeddings(
+        graph_directory,
+        model,
+        node_rows,
+        chunk_size=chunk_size,
+        device=device,
+        temporary_parent=temporary_parent,
+    )
+
+
 def train_streaming_gnn(
     graph_directory: str | Path,
     source_checkpoint: LoadedGNNCheckpoint | StreamingGNNState,
@@ -1211,6 +1284,8 @@ def reencode_streaming_gnn(
 __all__ = [
     "StreamingGNNManifest",
     "StreamingGNNState",
+    "infer_streaming_gnn_checkpoint_embeddings",
+    "infer_streaming_gnn_embeddings",
     "load_streaming_gnn_state",
     "reencode_streaming_gnn",
     "train_streaming_gnn",
