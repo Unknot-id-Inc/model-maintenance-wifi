@@ -38,7 +38,7 @@ ARCHITECTURE_ID = "gufu_ae_leaky_relu_kaiming_uniform_v2"
 CHECKPOINT_FORMAT = "gufu_ae_checkpoint_v1"
 FEATURE_FORMAT = "gufu_encoder_features_v1"
 AE_PROGRESS_DIAGNOSTIC_SCANS = 4
-AE_DECODER_OUTPUT_LAYER_INDEX = 8
+AE_DECODER_OUTPUT_LAYER_INDEX = 9
 
 
 class AEModelConfig(BaseModel):
