@@ -297,23 +297,41 @@ class AECheckpointManifest(BaseModel):
         if self.epochs_completed > self.training_config.epochs:
             raise ValueError("completed epoch count exceeds configured target")
         if self.checkpoint_objective == "streaming_eq10_update_v1":
-            if self.initialization_mode not in {"streaming_update", "vocabulary_migration"}:
-                raise ValueError("Eq. (10) checkpoints must declare streaming update or its vocabulary migration")
+            if self.initialization_mode not in {
+                "streaming_update",
+                "vocabulary_migration",
+            }:
+                raise ValueError(
+                    "Eq. (10) checkpoints must declare streaming update or its vocabulary migration"
+                )
             if self.training_resume_compatible:
-                raise ValueError("Eq. (10) checkpoint is not a generic AE epoch-boundary resume")
+                raise ValueError(
+                    "Eq. (10) checkpoint is not a generic AE epoch-boundary resume"
+                )
             if self.source_checkpoint_sha256 is None:
-                raise ValueError("Eq. (10) checkpoint must identify its source AE checkpoint")
+                raise ValueError(
+                    "Eq. (10) checkpoint must identify its source AE checkpoint"
+                )
             if len(self.update_loss_components) != self.epochs_completed:
-                raise ValueError("Eq. (10) component history must align with completed epochs")
+                raise ValueError(
+                    "Eq. (10) component history must align with completed epochs"
+                )
             if any(
-                len(row) != 3 or any(not torch.isfinite(torch.tensor(value)).item() for value in row)
+                len(row) != 3
+                or any(not torch.isfinite(torch.tensor(value)).item() for value in row)
                 for row in self.update_loss_components
             ):
-                raise ValueError("Eq. (10) component history must contain finite triples")
+                raise ValueError(
+                    "Eq. (10) component history must contain finite triples"
+                )
         elif self.update_loss_components:
-            raise ValueError("pretraining checkpoints cannot carry Eq. (10) component history")
+            raise ValueError(
+                "pretraining checkpoints cannot carry Eq. (10) component history"
+            )
         if self.initialization_mode == "resume" and not self.training_resume_compatible:
-            raise ValueError("this checkpoint is not compatible with generic AE training resume")
+            raise ValueError(
+                "this checkpoint is not compatible with generic AE training resume"
+            )
         if self.initialization_mode == "resume":
             if self.source_checkpoint_sha256 is None:
                 raise ValueError(
@@ -415,7 +433,7 @@ class AE(nn.Module):
         self.input_dim = input_dim
         self.E = nn.Sequential(
             nn.Linear(input_dim, selected_config.dense_width),
-            # nn.ReLU(),
+            nn.LeakyReLU(negative_slope=0.1),
             nn.Linear(selected_config.dense_width, selected_config.latent_dim),
             nn.Conv1d(1, 1, 3, padding=1),
             nn.LeakyReLU(negative_slope=0.1),
@@ -434,7 +452,7 @@ class AE(nn.Module):
             nn.LeakyReLU(negative_slope=0.1),
             nn.ConvTranspose1d(1, 1, 3, padding=1),
             nn.Linear(selected_config.latent_dim, selected_config.dense_width),
-            # nn.ReLU(),
+            nn.LeakyReLU(negative_slope=0.1),
             nn.Linear(selected_config.dense_width, input_dim),
         )
         for layer in self.modules():
@@ -1008,7 +1026,9 @@ def train_autoencoder(
             ):
                 raise ValueError("source checkpoint does not contain resumable state")
             if not source_manifest.training_resume_compatible:
-                raise ValueError("source checkpoint is not a compatible generic AE resume boundary")
+                raise ValueError(
+                    "source checkpoint is not a compatible generic AE resume boundary"
+                )
         elif initialization == "weights_only":
             if source_manifest.epochs_completed < 1:
                 raise ValueError("weights_only source must contain trained weights")

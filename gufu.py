@@ -64,7 +64,7 @@ if DATA_PROFILE == "real_dataset":
     AE_ACTION = "train"  # Set to "train" to train through the selected run mode.
     GNN_ACTION = "train"  # Set to "train" to train through the selected run mode.
     AE_TRAINING_CONFIG = AETrainingConfig(
-        epochs=200,
+        epochs=150,
         batch_size=32,
         learning_rate=0.01,
         seed=SEED,
@@ -75,7 +75,7 @@ if DATA_PROFILE == "real_dataset":
         loss=AE_LOSS,
     )
     GNN_TRAINING_CONFIG = GNNTrainingConfig(
-        epochs=50,
+        epochs=100,
         learning_rate=0.01,
         weight_decay=0.0,
         seed=SEED,
@@ -90,14 +90,14 @@ if DATA_PROFILE == "real_dataset":
         virtual_edge_sigma=0.9,
         contrastive_temperature=0.1,
         negative_weight=1.0,
-        gnn_epochs=1,
-        updater_epochs=100,
-        ae_epochs=25,
+        gnn_epochs=50,
+        updater_epochs=200,
+        ae_epochs=75,
         seed=SEED,
     )
     TRANSITION_CONFIG = TransitionConfig(
         link_prediction=LINK_CONFIG,
-        ae_finetune_epochs=25,
+        ae_finetune_epochs=75,
         ae_finetune_seed=1701,
         reinitialize_seed=1702,
     )
@@ -764,7 +764,9 @@ else:
         f"result radio edges={lp_manifest.updated_edge_count:,}"
     )
     if lp_manifest.failure_reason:
-        _report_pipeline_progress(f"Link prediction failure: {lp_manifest.failure_reason}")
+        _report_pipeline_progress(
+            f"Link prediction failure: {lp_manifest.failure_reason}"
+        )
     _report_pipeline_progress(f"Streaming input: {STREAMING_LP_INPUT_DIR}")
     _report_pipeline_progress(f"Streaming result: {STREAMING_LP_RESULT_DIR}")
     for proposal in islice(streaming_lp_result.iter_added_edges(), 10):
