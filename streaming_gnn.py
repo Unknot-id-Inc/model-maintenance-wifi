@@ -46,14 +46,14 @@ from streaming_update import MappedStreamingOnlineGraph, load_streaming_online_g
 from training_progress import DEFAULT_LOG_EVERY_K_EPOCHS, log_training_epoch, validate_log_interval
 
 
-STREAM_GNN_FORMAT = "gufu_streaming_gnn_v6"
-STREAM_GNN_TRAINING_POLICY = "chunked_full_graph_softplus_cosine_rssi_pairs_explicit_dropout_spatial_v6"
+STREAM_GNN_FORMAT = "gufu_streaming_gnn_v7"
+STREAM_GNN_TRAINING_POLICY = "chunked_full_graph_softplus_cosine_terminal_node_refinement_v7"
 
 
 class StreamingGNNManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_gnn_v6"] = STREAM_GNN_FORMAT
+    format: Literal["gufu_streaming_gnn_v7"] = STREAM_GNN_FORMAT
     artifact_id: str = Field(pattern=r"^streamgnn:[0-9a-f]{64}$")
     online_graph_id: str = Field(pattern=r"^onlinegraph:[0-9a-f]{64}$")
     dataset_id: str
@@ -71,7 +71,7 @@ class StreamingGNNManifest(BaseModel):
     model_config_record: GNNModelConfig
     training_config: GNNTrainingConfig
     training_policy: Literal[
-        "chunked_full_graph_softplus_cosine_rssi_pairs_explicit_dropout_spatial_v6"
+        "chunked_full_graph_softplus_cosine_terminal_node_refinement_v7"
     ] = STREAM_GNN_TRAINING_POLICY
     dropout_rng_policy: Literal["per_epoch_layer_kind_chunk_sequence_v1"] = (
         "per_epoch_layer_kind_chunk_sequence_v1"
@@ -367,6 +367,83 @@ def _forward_stream(
         h_paths.append(h_next_path)
         e_paths.append(e_next_path)
 
+    # Terminal node refinement: consume the final physical-edge vectors so
+    # the last W2 update participates in the node-only training objective.
+    terminal_layer = model_config.num_layers
+    terminal_w0_index = 3 * terminal_layer
+    terminal_w1_index = terminal_w0_index + 1
+    terminal_aggregate_path = work_directory / "aggregate_terminal.npy"
+    terminal_aggregate = _open_array(terminal_aggregate_path, (count_nodes, dim))
+    terminal_aggregate[:] = 0.0
+    terminal_message_generator = (
+        _generator(_seed(training_seed, epoch, terminal_layer, 1))
+        if training_seed is not None
+        else None
+    )
+    for direction in range(2):
+        for start in range(0, count_edges, chunk_size):
+            stop = min(start + chunk_size, count_edges)
+            endpoints = _edge_endpoints(graph, start, stop)
+            source = endpoints[:, 1] if direction == 0 else endpoints[:, 0]
+            target = endpoints[:, 0] if direction == 0 else endpoints[:, 1]
+            edge_features = _edge_features(graph, e_current, start, stop)
+            source_features = np.asarray(h_current[source], dtype=np.float32)
+            message_inputs = torch.cat(
+                (_tensor(edge_features, device), _tensor(source_features, device)),
+                dim=1,
+            )
+            messages = F.leaky_relu(
+                F.linear(message_inputs, parameters[terminal_w0_index]),
+                negative_slope=0.1,
+            )
+            mask = _dropout_mask(
+                stop - start,
+                dim,
+                model_config.dropout_probability,
+                terminal_message_generator,
+                device,
+            ) if training_seed is not None else None
+            messages = _apply_dropout(messages, mask)
+            np.add.at(terminal_aggregate, target, messages.detach().cpu().numpy())
+    if isinstance(terminal_aggregate, np.memmap):
+        terminal_aggregate.flush()
+    aggregate_paths.append(terminal_aggregate_path)
+
+    terminal_h_path = work_directory / "h_layer_terminal.npy"
+    terminal_h = _open_array(terminal_h_path, (count_nodes, dim))
+    terminal_node_generator = (
+        _generator(_seed(training_seed, epoch, terminal_layer, 2))
+        if training_seed is not None
+        else None
+    )
+    for start in range(0, count_nodes, chunk_size):
+        stop = min(start + chunk_size, count_nodes)
+        self_features = _tensor(h_current[start:stop], device)
+        mean_aggregate = np.asarray(
+            terminal_aggregate[start:stop], dtype=np.float32
+        ) / np.maximum(degree[start:stop], 1).astype(np.float32)[:, None]
+        node_inputs = torch.cat(
+            (self_features, _tensor(mean_aggregate, device)), dim=1
+        )
+        node_values = F.leaky_relu(
+            F.linear(node_inputs, parameters[terminal_w1_index]),
+            negative_slope=0.1,
+        )
+        mask = _dropout_mask(
+            stop - start,
+            dim,
+            model_config.dropout_probability,
+            terminal_node_generator,
+            device,
+        ) if training_seed is not None else None
+        node_values = F.normalize(
+            _apply_dropout(node_values, mask), p=2.0, dim=1, eps=1e-12
+        )
+        terminal_h[start:stop] = node_values.detach().cpu().numpy()
+    if isinstance(terminal_h, np.memmap):
+        terminal_h.flush()
+    h_paths.append(terminal_h_path)
+
     return h_paths, e_paths, aggregate_paths, degree
 
 
@@ -440,6 +517,118 @@ def _accumulate_parameter_gradient(parameter: Tensor, gradient: Tensor, gradient
         gradients[key] = gradient.detach().clone()
 
 
+def _backward_terminal_refinement(
+    graph: MappedStreamingOnlineGraph,
+    model_config: GNNModelConfig,
+    parameters: tuple[Tensor, ...],
+    h_paths: list[Path],
+    e_paths: list[Path],
+    aggregate_paths: list[Path],
+    degree: np.ndarray,
+    final_gradient_path: Path,
+    work_directory: Path,
+    *,
+    chunk_size: int,
+    seed: int,
+    epoch: int,
+    device: torch.device,
+):
+    """Backpropagate the node loss through the terminal node refinement."""
+    count_nodes = len(graph.manifest.node_ids)
+    count_radio = graph.manifest.radio_edge_count
+    count_edges = count_radio + graph.manifest.virtual_edge_count
+    dim = model_config.graph_feature_dim
+    terminal_layer = model_config.num_layers
+    terminal_w0_index = 3 * terminal_layer
+    terminal_w1_index = terminal_w0_index + 1
+    h_input = np.load(h_paths[-2], mmap_mode="r", allow_pickle=False)
+    e_input = np.load(e_paths[-1], mmap_mode="r", allow_pickle=False)
+    aggregate = np.load(aggregate_paths[-1], mmap_mode="r", allow_pickle=False)
+    grad_h_upstream = np.load(final_gradient_path, mmap_mode="r", allow_pickle=False)
+    gradients: dict[int, Tensor] = {}
+
+    # Differentiate the terminal node projection with respect to its node and
+    # aggregate inputs, then propagate the aggregate gradient into messages.
+    grad_h_input_path = work_directory / "gradient_h_terminal_input.npy"
+    grad_h_input = _open_array(grad_h_input_path, (count_nodes, dim))
+    grad_a_path = work_directory / "gradient_a_terminal.npy"
+    grad_a = _open_array(grad_a_path, (count_nodes, dim))
+    node_generator = _generator(_seed(seed, epoch, terminal_layer, 2))
+    terminal_w1 = parameters[terminal_w1_index]
+    for start in range(0, count_nodes, chunk_size):
+        stop = min(start + chunk_size, count_nodes)
+        self_features = _tensor(h_input[start:stop], device)
+        mean_aggregate = np.asarray(aggregate[start:stop], dtype=np.float32) / np.maximum(
+            degree[start:stop], 1
+        ).astype(np.float32)[:, None]
+        inputs = torch.cat(
+            (self_features, _tensor(mean_aggregate, device)), dim=1
+        ).requires_grad_(True)
+        values = F.leaky_relu(F.linear(inputs, terminal_w1), negative_slope=0.1)
+        mask = _dropout_mask(
+            stop - start, dim, model_config.dropout_probability,
+            node_generator, device,
+        )
+        values = F.normalize(
+            _apply_dropout(values, mask), p=2.0, dim=1, eps=1e-12
+        )
+        upstream = _tensor(grad_h_upstream[start:stop], device)
+        scalar = (values * upstream).sum()
+        grad_inputs, grad_weight = torch.autograd.grad(scalar, (inputs, terminal_w1))
+        _accumulate_parameter_gradient(terminal_w1, grad_weight, gradients)
+        values_grad = grad_inputs.detach().cpu().numpy()
+        grad_h_input[start:stop] = values_grad[:, :dim]
+        grad_a[start:stop] = values_grad[:, dim:]
+    for array in (grad_h_input, grad_a):
+        if isinstance(array, np.memmap):
+            array.flush()
+
+    grad_h_message_path = work_directory / "gradient_h_terminal_message.npy"
+    grad_h_message = _open_array(grad_h_message_path, (count_nodes, dim))
+    grad_h_message[:] = grad_h_input
+    grad_e_path = work_directory / "gradient_e_terminal_output.npy"
+    grad_e = _open_array(grad_e_path, (count_radio, dim))
+    grad_e[:] = 0.0
+    aggregate_gradient = np.load(grad_a_path, mmap_mode="r", allow_pickle=False)
+    message_generator = _generator(_seed(seed, epoch, terminal_layer, 1))
+    terminal_w0 = parameters[terminal_w0_index]
+    for direction in range(2):
+        for start in range(0, count_edges, chunk_size):
+            stop = min(start + chunk_size, count_edges)
+            endpoints = _edge_endpoints(graph, start, stop)
+            source = endpoints[:, 1] if direction == 0 else endpoints[:, 0]
+            target = endpoints[:, 0] if direction == 0 else endpoints[:, 1]
+            source_features = _tensor(h_input[source], device, requires_grad=True)
+            edge_features = _tensor(
+                _edge_features(graph, e_input, start, stop),
+                device,
+                requires_grad=True,
+            )
+            inputs = torch.cat((edge_features, source_features), dim=1).requires_grad_(True)
+            values = F.leaky_relu(F.linear(inputs, terminal_w0), negative_slope=0.1)
+            mask = _dropout_mask(
+                stop - start, dim, model_config.dropout_probability,
+                message_generator, device,
+            )
+            values = _apply_dropout(values, mask)
+            valid_degree = np.maximum(degree[target], 1).astype(np.float32)
+            upstream_np = np.asarray(aggregate_gradient[target], dtype=np.float32) / valid_degree[:, None]
+            upstream = _tensor(upstream_np, device)
+            scalar = (values * upstream).sum()
+            grad_inputs, grad_weight = torch.autograd.grad(scalar, (inputs, terminal_w0))
+            _accumulate_parameter_gradient(terminal_w0, grad_weight, gradients)
+            grad_values = grad_inputs.detach().cpu().numpy()
+            np.add.at(grad_h_message, source, grad_values[:, dim:])
+            radio_stop = min(stop, count_radio)
+            if start < radio_stop:
+                radio_rows = np.arange(start, radio_stop)
+                np.add.at(grad_e, radio_rows, grad_values[: radio_stop - start, :dim])
+    for array in (grad_h_message, grad_e):
+        if isinstance(array, np.memmap):
+            array.flush()
+    return grad_h_message_path, grad_e_path, gradients
+
+
 def _backward_stream(
     graph: MappedStreamingOnlineGraph,
     model_config: GNNModelConfig,
@@ -461,17 +650,30 @@ def _backward_stream(
     count_virtual = graph.manifest.virtual_edge_count
     count_edges = count_radio + count_virtual
     dim = model_config.graph_feature_dim
-    gradients: dict[int, Tensor] = {}
-    grad_h_out = np.load(final_gradient_path, mmap_mode="r+", allow_pickle=False)
-    grad_e_out_path: Path | None = None
+    grad_h_path, grad_e_out_path, gradients = _backward_terminal_refinement(
+        graph,
+        model_config,
+        parameters,
+        h_paths,
+        e_paths,
+        aggregate_paths,
+        degree,
+        final_gradient_path,
+        work_directory,
+        chunk_size=chunk_size,
+        seed=seed,
+        epoch=epoch,
+        device=device,
+    )
+    grad_h_out = np.load(grad_h_path, mmap_mode="r", allow_pickle=False)
 
     for layer in reversed(range(model_config.num_layers)):
         h_input = np.load(h_paths[layer], mmap_mode="r", allow_pickle=False)
         h_output = np.load(h_paths[layer + 1], mmap_mode="r", allow_pickle=False)
         e_input = np.load(e_paths[layer], mmap_mode="r", allow_pickle=False)
 
-        # Backpropagate the next layer's message gradient through this layer's
-        # physical-edge update. The last edge update is unused by Eq. (4).
+        # Backpropagate the terminal/next node layer's message gradient through
+        # this layer's physical-edge update.
         grad_h_extra_path = work_directory / f"gradient_h_edge_{layer}.npy"
         grad_h_extra = _open_array(grad_h_extra_path, (count_nodes, dim))
         grad_h_extra[:] = 0.0
@@ -622,7 +824,7 @@ class _StreamedEquation4(torch.autograd.Function):
         chunk_size,
         *objective_and_parameters,
     ):
-        parameter_count = 3 * model_config.num_layers
+        parameter_count = 3 * model_config.num_layers + 2
         optional_input_count = len(objective_and_parameters) - parameter_count
         if optional_input_count not in (0, 2):
             raise ValueError("streamed contrastive loss received invalid objective arguments")
@@ -720,6 +922,7 @@ def _parameter_order(model: EdgeFeatureSAGE) -> tuple[Tensor, ...]:
     result = []
     for layer in range(model.config.num_layers):
         result.extend((model.W0[layer], model.W1[layer], model.W2[layer]))
+    result.extend((model.W0_terminal, model.W1_terminal))
     return tuple(result)
 
 

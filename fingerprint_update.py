@@ -55,7 +55,7 @@ from sage_ve import (
 from training_progress import DEFAULT_LOG_EVERY_K_EPOCHS, log_training_epoch, validate_log_interval
 
 
-UPDATE_CHECKPOINT_FORMAT = "gufu_fingerprint_update_checkpoint_v4"
+UPDATE_CHECKPOINT_FORMAT = "gufu_fingerprint_update_checkpoint_v5"
 UPDATE_ARTIFACT_FORMAT = "gufu_updated_fingerprints_v1"
 GRAPH_DIM = 34
 ENCODER_DIM = 32
@@ -443,7 +443,7 @@ class UpdateEpochLoss(BaseModel):
 class FingerprintUpdateManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_fingerprint_update_checkpoint_v4"] = UPDATE_CHECKPOINT_FORMAT
+    format: Literal["gufu_fingerprint_update_checkpoint_v5"] = UPDATE_CHECKPOINT_FORMAT
     run_id: str
     config: FingerprintUpdateConfig
     dataset_id: str

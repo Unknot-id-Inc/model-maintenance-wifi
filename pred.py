@@ -46,6 +46,7 @@ from fingerprint_update import (
     FingerprintUpdateConfig,
     FingerprintUpdateManifest,
     FingerprintUpdaterModels,
+    UPDATE_CHECKPOINT_FORMAT,
     load_fingerprint_update_checkpoint,
     load_updated_fingerprints,
     prepare_fingerprint_update,
@@ -520,7 +521,7 @@ def _load_pipeline_snapshot(
         raise ValueError("completed batch snapshot is missing its learned updater checkpoint")
     if updater_path is not None:
         updater_payload = load_torch_state(updater_path, map_location="cpu")
-        if updater_payload.get("format") != "gufu_fingerprint_update_checkpoint_v4":
+        if updater_payload.get("format") != UPDATE_CHECKPOINT_FORMAT:
             raise ValueError("completed snapshot updater checkpoint has an unsupported format")
         updater_manifest = FingerprintUpdateManifest.model_validate_json(
             updater_payload["manifest_json"]

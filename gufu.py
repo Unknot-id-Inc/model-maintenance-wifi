@@ -173,10 +173,10 @@ if DEVICE == "cpu":
 # Stable run IDs make cell re-execution reuse the same validated artifacts.
 # Change this string deliberately to create a separate run and train fresh models.
 RUN_ID = (
-    f"cpu-smoke-real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v1-softplus-cosine-t0p1-nw1-"
+    f"cpu-smoke-real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v1-softplus-cosine-t0p1-nw1-terminal-node-v1-"
     f"d{AE_DENSE_WIDTH}-z{AE_LATENT_DIM}-drop{str(AE_DROPOUT_PROBABILITY).replace('.', 'p')}"
     if DATA_PROFILE == "cpu_smoke"
-    else f"real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v1-softplus-cosine-t0p1-nw1-"
+    else f"real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v1-softplus-cosine-t0p1-nw1-terminal-node-v1-"
     f"d{AE_DENSE_WIDTH}-z{AE_LATENT_DIM}-drop{str(AE_DROPOUT_PROBABILITY).replace('.', 'p')}"
 )
 RUN_DIR = Path("output") / "notebook_runs" / DATASET_ID / RUN_ID

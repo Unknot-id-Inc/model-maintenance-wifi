@@ -35,9 +35,9 @@ from training_progress import (
     validate_log_interval,
 )
 
-GNN_ARCHITECTURE_ID = "gufu_algorithm1_edge_feature_mean_softplus_cosine_v3"
-GNN_CHECKPOINT_FORMAT = "gufu_gnn_checkpoint_v5"
-GNN_FEATURE_FORMAT = "gufu_gnn_features_v1"
+GNN_ARCHITECTURE_ID = "gufu_algorithm1_terminal_node_refinement_softplus_cosine_v4"
+GNN_CHECKPOINT_FORMAT = "gufu_gnn_checkpoint_v6"
+GNN_FEATURE_FORMAT = "gufu_gnn_features_v2"
 DEFAULT_GNN_DIM = 34
 
 
@@ -50,7 +50,7 @@ class GNNModelConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    architecture_id: Literal["gufu_algorithm1_edge_feature_mean_softplus_cosine_v3"] = (
+    architecture_id: Literal["gufu_algorithm1_terminal_node_refinement_softplus_cosine_v4"] = (
         GNN_ARCHITECTURE_ID
     )
     graph_feature_dim: int = Field(default=DEFAULT_GNN_DIM, ge=1)
@@ -68,6 +68,9 @@ class GNNModelConfig(BaseModel):
     edge_update_scope: Literal["physical_radio_edges_only"] = (
         "physical_radio_edges_only"
     )
+    terminal_node_refinement: Literal[
+        "one_node_update_after_final_edge_update_v1"
+    ] = "one_node_update_after_final_edge_update_v1"
     physical_edge_endpoint_order: Literal["sample_then_ap"] = "sample_then_ap"
     virtual_edge_update_policy: Literal["retain_initial_mean_then_remove"] = (
         "retain_initial_mean_then_remove"
@@ -147,8 +150,8 @@ class GNNCheckpointManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_gnn_checkpoint_v5"] = GNN_CHECKPOINT_FORMAT
-    architecture_id: Literal["gufu_algorithm1_edge_feature_mean_softplus_cosine_v3"] = (
+    format: Literal["gufu_gnn_checkpoint_v6"] = GNN_CHECKPOINT_FORMAT
+    architecture_id: Literal["gufu_algorithm1_terminal_node_refinement_softplus_cosine_v4"] = (
         GNN_ARCHITECTURE_ID
     )
     model_config_record: GNNModelConfig
@@ -232,7 +235,7 @@ class GNNFeatureArtifact(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_gnn_features_v1"] = GNN_FEATURE_FORMAT
+    format: Literal["gufu_gnn_features_v2"] = GNN_FEATURE_FORMAT
     feature_space: Literal["z_gnn_node"] = "z_gnn_node"
     edge_feature_space: Literal["z_gnn_physical_edge"] = "z_gnn_physical_edge"
     graph_id: str = Field(pattern=r"^graph:[0-9a-f]{64}$")
@@ -368,7 +371,7 @@ class GNNTrainingResult:
 
 
 class EdgeFeatureSAGE(nn.Module):
-    """Algorithm 1 node/edge updates with an explicit edge-vector message."""
+    """Algorithm 1 updates plus a terminal node refinement using final edges."""
 
     def __init__(self, config: GNNModelConfig | None = None):
         super().__init__()
@@ -379,6 +382,8 @@ class EdgeFeatureSAGE(nn.Module):
         self.W0 = nn.ParameterList()
         self.W1 = nn.ParameterList()
         self.W2 = nn.ParameterList()
+        self.W0_terminal: nn.Parameter
+        self.W1_terminal: nn.Parameter
         # Use a local RNG fork so creating a model does not perturb caller state.
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.config.initialization_seed)
@@ -392,6 +397,16 @@ class EdgeFeatureSAGE(nn.Module):
                 self.W0.append(w0)
                 self.W1.append(w1)
                 self.W2.append(w2)
+            w0_terminal = nn.Parameter(
+                torch.empty(self.feature_dim, 2 * self.feature_dim)
+            )
+            w1_terminal = nn.Parameter(
+                torch.empty(self.feature_dim, 2 * self.feature_dim)
+            )
+            nn.init.xavier_uniform_(w0_terminal)
+            nn.init.xavier_uniform_(w1_terminal)
+            self.W0_terminal = w0_terminal
+            self.W1_terminal = w1_terminal
         self._inference_only = False
         self._training_started = False
         self._training_completed = False
@@ -535,6 +550,55 @@ class EdgeFeatureSAGE(nn.Module):
                 edge_features = torch.cat(
                     (updated_radio, edge_features[radio_count:]), dim=0
                 )
+
+        # The paper's node-only objective cannot train the final edge update
+        # unless those edge vectors feed one more node aggregation. This local
+        # terminal refinement makes the last W2 output part of the loss path.
+        if edge_count:
+            terminal_message_inputs = torch.cat(
+                (
+                    edge_features[message_edge_rows],
+                    node_features[message_source_rows],
+                ),
+                dim=1,
+            )
+            terminal_messages = F.leaky_relu(
+                F.linear(terminal_message_inputs, self.W0_terminal),
+                negative_slope=0.1,
+            )
+            terminal_messages = F.dropout(
+                terminal_messages,
+                p=self.config.dropout_probability,
+                training=self.training,
+            )
+            terminal_aggregate = node_features.new_zeros(
+                (node_features.shape[0], self.feature_dim)
+            )
+            terminal_aggregate.index_add_(
+                0, message_target_rows, terminal_messages
+            )
+            terminal_degree = torch.bincount(
+                message_target_rows, minlength=node_features.shape[0]
+            ).to(dtype=node_features.dtype)
+            terminal_degree = terminal_degree.clamp_min(1.0).unsqueeze(1)
+            terminal_aggregate = terminal_aggregate / terminal_degree
+        else:
+            terminal_aggregate = node_features.new_zeros(
+                (node_features.shape[0], self.feature_dim)
+            )
+        terminal_node_inputs = torch.cat(
+            (node_features, terminal_aggregate), dim=1
+        )
+        node_features = F.leaky_relu(
+            F.linear(terminal_node_inputs, self.W1_terminal),
+            negative_slope=0.1,
+        )
+        node_features = F.dropout(
+            node_features,
+            p=self.config.dropout_probability,
+            training=self.training,
+        )
+        node_features = F.normalize(node_features, p=2.0, dim=1, eps=1e-12)
 
         return GNNOutput(
             node_features=node_features,
