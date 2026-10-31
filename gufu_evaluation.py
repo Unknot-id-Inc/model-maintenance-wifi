@@ -17,10 +17,10 @@ import torch
 from fingerprint_update import (
     LocationPredictor,
     UpdatedFingerprintArtifact,
-    UpdateLocationScaler,
 )
 from gufu_data import EvaluationPosition
 from gufu_data import PreparedDataset
+from spatial_normalization import FittedSpatialTransform
 
 
 class ReferenceRSSIMetric(BaseModel):
@@ -170,6 +170,7 @@ def train_reference_location_mlp_predictions(
     reference_coordinates: Sequence[Sequence[float]] | np.ndarray,
     query_embeddings: Sequence[Sequence[float]] | np.ndarray,
     *,
+    spatial_transform: FittedSpatialTransform,
     hidden_dim: int,
     epochs: int,
     learning_rate: float,
@@ -182,7 +183,7 @@ def train_reference_location_mlp_predictions(
     their bootstrap coordinates train the MLP. Query coordinates are never read.
     """
     x_ref = np.asarray(reference_embeddings, dtype=np.float32)
-    xy_ref = np.asarray(reference_coordinates, dtype=np.float32)
+    xy_ref = np.asarray(reference_coordinates, dtype=np.float64)
     x_query = np.asarray(query_embeddings, dtype=np.float32)
     if x_ref.ndim != 2 or x_query.ndim != 2 or x_ref.shape[1] != x_query.shape[1]:
         raise ValueError("reference/query embedding matrices must have matching widths")
@@ -193,19 +194,16 @@ def train_reference_location_mlp_predictions(
     if hidden_dim < 1 or epochs < 1 or learning_rate <= 0.0:
         raise ValueError("localization MLP training configuration is invalid")
 
-    scaler = UpdateLocationScaler(
-        x_min=float(xy_ref[:, 0].min()),
-        x_max=float(xy_ref[:, 0].max()),
-        y_min=float(xy_ref[:, 1].min()),
-        y_max=float(xy_ref[:, 1].max()),
-    )
     selected_device = torch.device(device)
     if selected_device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError(f"requested CUDA device is unavailable: {selected_device}")
     x_train = torch.as_tensor(x_ref, dtype=torch.float32, device=selected_device)
-    y_raw = torch.as_tensor(xy_ref, dtype=torch.float32, device=selected_device)
     x_test = torch.as_tensor(x_query, dtype=torch.float32, device=selected_device)
-    y_train = scaler.encode(y_raw)
+    y_train = torch.as_tensor(
+        spatial_transform.transform(xy_ref),
+        dtype=torch.float32,
+        device=selected_device,
+    )
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(seed)
         model = LocationPredictor(hidden_dim, x_ref.shape[1]).to(selected_device)
@@ -226,7 +224,7 @@ def train_reference_location_mlp_predictions(
             optimizer.step()
         model.eval()
         with torch.no_grad():
-            prediction = scaler.decode(model(x_test))
+            prediction = spatial_transform.inverse_transform(model(x_test))
     result = prediction.detach().cpu().numpy().astype(np.float64, copy=False)
     if not np.isfinite(result).all():
         raise FloatingPointError("localization MLP produced non-finite coordinates")

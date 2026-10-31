@@ -26,6 +26,7 @@ from sage_ve import (
     train_gnn,
 )
 from streaming_pipeline import StreamingPipelineConfig, run_streaming_sequential
+from spatial_normalization import fit_spatial_transform
 
 
 def _bootstrap(tmp_path):
@@ -66,10 +67,20 @@ def _bootstrap(tmp_path):
     ae_features = encode_prepared_dataset(
         prepared, ae_path, tmp_path / "ae-features.json", batch_size=2
     )
+    spatial_path = tmp_path / "spatial" / "stream-test.json"
+    fit_spatial_transform(
+        [(position.x, position.y) for position in prepared.training_reference_positions()],
+        prepared.config.dataset_id,
+        provenance={"source": "test bootstrap training positions"},
+    ).save(spatial_path)
     graph_config = GraphBuildConfig(
         virtual_edge_strategy="paper_cosine_threshold",
-        virtual_edge_sigma=-1.0,
+        virtual_edge_sigma=0.993,
+        negative_similarity_threshold=0.992,
+        minimum_shared_aps=1,
         pseudo_location_seed=12,
+        spatial_normalization_enabled=True,
+        spatial_transform_path=str(spatial_path),
     )
     graph = build_graph_state(prepared, ae_features, graph_config)
     gnn_path = tmp_path / "gnn.pt"
@@ -103,9 +114,7 @@ def _bootstrap(tmp_path):
     assert loaded_manifest.encoder_feature_dim == graph.encoder_feature_dim
     np.testing.assert_array_equal(
         mapped_input.sample_signal_features,
-        np.asarray(graph.node_features)[
-            : len(graph.sample_node_ids), : graph.encoder_feature_dim
-        ],
+        np.asarray(graph.sample_rssi_features),
     )
     link = LinkPredictionConfig(
         max_iterations=2, convergence_epsilon=1e9, link_threshold=0.0

@@ -43,7 +43,12 @@ from sage_ve import (
     LoadedGNNCheckpoint,
 )
 from streaming_update import MappedStreamingOnlineGraph, load_streaming_online_graph
-from training_progress import DEFAULT_LOG_EVERY_K_EPOCHS, log_training_epoch, validate_log_interval
+from training_progress import (
+    DEFAULT_LOG_EVERY_K_EPOCHS,
+    log_training_epoch,
+    log_training_start,
+    validate_log_interval,
+)
 
 
 STREAM_GNN_FORMAT = "gufu_streaming_gnn_v7"
@@ -988,6 +993,102 @@ def infer_streaming_gnn_embeddings(
         shutil.rmtree(temporary_directory, ignore_errors=True)
 
 
+def infer_streaming_gnn_state(
+    graph_directory: str | Path,
+    source_state: StreamingGNNState,
+    output_directory: str | Path,
+    *,
+    chunk_size: int = 4096,
+    device: str | torch.device = "cpu",
+) -> StreamingGNNState:
+    """Persist source-GNN embeddings recomputed once over another graph.
+
+    The checkpoint weights and their training history remain those of
+    ``source_state``; only graph-bound node and edge embeddings are recomputed.
+    This is used when a downstream updater must consume one-pass GNN outputs
+    for both references and incoming scans on the same graph.
+    """
+    if chunk_size < 1:
+        raise ValueError("streaming GNN inference chunk_size must be positive")
+    graph = load_streaming_online_graph(graph_directory)
+    if graph.manifest.reference_graph_id != source_state.manifest.reference_graph_id:
+        raise ValueError("inference graph and source GNN use different reference graph lineage")
+    if graph.manifest.reference_gnn_checkpoint_sha256 != source_state.manifest.checkpoint_sha256:
+        raise ValueError("inference graph was built from a different source GNN checkpoint")
+    config = source_state.manifest.model_config_record
+    if config.graph_feature_dim != graph.manifest.node_feature_dim:
+        raise ValueError("source GNN width is incompatible with inference graph")
+    selected_device = torch.device(device)
+    if selected_device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError(f"requested CUDA device is unavailable: {selected_device}")
+
+    target = Path(output_directory)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        raise FileExistsError(f"refusing to overwrite inferred streaming GNN state: {target}")
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+    try:
+        model = EdgeFeatureSAGE(config).to(device=selected_device, dtype=torch.float32)
+        model.load_state_dict(source_state.model.state_dict(), strict=True)
+        model.eval()
+        with tempfile.TemporaryDirectory(prefix="gufu-stream-gnn-rebind-") as work:
+            node_path, radio_path = _stream_inference(
+                graph, model, Path(work), chunk_size=chunk_size
+            )
+            shutil.copyfile(node_path, staging / "node_embeddings.npy")
+            shutil.copyfile(radio_path, staging / "radio_edge_features.npy")
+        shutil.copyfile(
+            source_state.directory / source_state.manifest.checkpoint_name,
+            staging / "gnn_state.pt",
+        )
+        arrays = (
+            _artifact(staging / "node_embeddings.npy", "node_embeddings.npy"),
+            _artifact(staging / "radio_edge_features.npy", "radio_edge_features.npy"),
+        )
+        fields = dict(
+            online_graph_id=graph.manifest.online_graph_id,
+            dataset_id=graph.manifest.dataset_id,
+            reference_batch_id=graph.manifest.reference_batch_id,
+            update_batch_id=graph.manifest.update_batch_id,
+            reference_graph_id=graph.manifest.reference_graph_id,
+            reference_lp_result_id=graph.manifest.reference_lp_result_id,
+            source_gnn_checkpoint_sha256=source_state.manifest.checkpoint_sha256,
+            graph_build_config=graph.manifest.graph_build_config,
+            vocabulary_sha256=graph.manifest.vocabulary_sha256,
+            node_ids=graph.manifest.node_ids,
+            radio_edge_count=graph.manifest.radio_edge_count,
+            virtual_edge_count=graph.manifest.virtual_edge_count,
+            negative_pair_count=graph.manifest.negative_pair_count,
+            model_config_record=config,
+            training_config=source_state.manifest.training_config,
+            epochs_completed=source_state.manifest.epochs_completed,
+            loss_history=source_state.manifest.loss_history,
+            checkpoint_sha256=sha256_file(staging / "gnn_state.pt"),
+            arrays=arrays,
+        )
+        provisional = StreamingGNNManifest.model_construct(
+            artifact_id="streamgnn:" + "0" * 64,
+            **fields,
+        )
+        artifact_id = "streamgnn:" + canonical_json_digest(
+            provisional.model_dump(mode="json", exclude={"artifact_id"})
+        )
+        manifest = StreamingGNNManifest(artifact_id=artifact_id, **fields)
+        atomic_write_json(manifest, staging / "manifest.json")
+        atomic_write_json(
+            {
+                "format": "gufu_streaming_artifact_complete_v1",
+                "identity": manifest.artifact_id,
+                "manifest_sha256": sha256_file(staging / "manifest.json"),
+            },
+            staging / "COMPLETED.json",
+        )
+        os.replace(staging, target)
+        return load_streaming_gnn_state(target, graph_directory, device=selected_device)
+    except Exception:
+        raise
+
+
 def infer_streaming_gnn_checkpoint_embeddings(
     graph_directory: str | Path,
     checkpoint_path: str | Path,
@@ -1072,6 +1173,16 @@ def train_streaming_gnn(
     parameters = _parameter_order(model)
     history = []
     model.train()
+    log_training_start(
+        "Streaming batch GNN",
+        {
+            "nodes": len(graph.manifest.node_ids),
+            "radio_edges": graph.manifest.radio_edge_count,
+            "virtual_edges": graph.manifest.virtual_edge_count,
+            "negative_pairs": graph.manifest.negative_pair_count,
+            "chunk_size": chunk_size,
+        },
+    )
     for epoch in range(1, training_config.epochs + 1):
         optimizer.zero_grad(set_to_none=True)
         loss = _StreamedEquation4.apply(
@@ -1101,11 +1212,6 @@ def train_streaming_gnn(
             training_config.epochs,
             {
                 "loss": scalar_loss,
-                "nodes": len(graph.manifest.node_ids),
-                "radio_edges": graph.manifest.radio_edge_count,
-                "virtual_edges": graph.manifest.virtual_edge_count,
-                "negative_pairs": graph.manifest.negative_pair_count,
-                "chunk_size": chunk_size,
                 "learning_rate": optimizer.param_groups[0]["lr"],
             },
             every_k_epochs=log_every_epochs,
@@ -1286,6 +1392,7 @@ __all__ = [
     "StreamingGNNState",
     "infer_streaming_gnn_checkpoint_embeddings",
     "infer_streaming_gnn_embeddings",
+    "infer_streaming_gnn_state",
     "load_streaming_gnn_state",
     "reencode_streaming_gnn",
     "train_streaming_gnn",

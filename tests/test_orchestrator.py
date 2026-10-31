@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from pred import (
 )
 from gufu_artifacts import canonical_json_digest, load_torch_state, sha256_file
 from sage_ve import GNNModelConfig, GNNTrainingConfig
+from spatial_normalization import fit_spatial_transform
 
 
 AP_A = "001122334455"
@@ -93,8 +95,16 @@ def _configuration(dataset_id="orchestrator-test", *, latent_dim=32):
     )
     graph = GraphBuildConfig(
         virtual_edge_strategy="paper_cosine_threshold",
-        virtual_edge_sigma=-0.999,
+        virtual_edge_sigma=0.95,
+        negative_similarity_threshold=0.8,
+        minimum_shared_aps=1,
         pseudo_location_seed=9,
+        spatial_normalization_enabled=True,
+        spatial_transform_path=str(
+            Path(tempfile.gettempdir())
+            / "gufu-orchestrator-test-spatial"
+            / f"{dataset_id}.json"
+        ),
     )
     return OrchestrationConfig(
         dataset_id=dataset_id,
@@ -129,7 +139,7 @@ def _configuration(dataset_id="orchestrator-test", *, latent_dim=32):
         fingerprint_update=FingerprintUpdateConfig(
             hidden_dim=8,
             alpha=0.5,
-            virtual_edge_sigma=-0.999,
+            virtual_edge_sigma=0.95,
             gnn_epochs=1,
             updater_epochs=1,
             ae_epochs=1,
@@ -149,11 +159,20 @@ def _configuration(dataset_id="orchestrator-test", *, latent_dim=32):
 
 
 def _bootstrap(root, path, configuration):
-    return prepare_dataset_files(
+    prepared = prepare_dataset_files(
         (path,),
         configuration.preprocessing("fingerprint0", "bootstrap_reference"),
         source_root=root,
     )
+    transform_path = configuration.graph_build.spatial_transform_path
+    if transform_path is None:
+        raise AssertionError("orchestrator test configuration lacks a spatial transform path")
+    fit_spatial_transform(
+        [(position.x, position.y) for position in prepared.training_reference_positions()],
+        prepared.config.dataset_id,
+        provenance={"source": "test bootstrap training positions"},
+    ).save(transform_path, overwrite=True)
+    return prepared
 
 
 def _run(root, output, configuration, bootstrap, bootstrap_path, updates, **kwargs):

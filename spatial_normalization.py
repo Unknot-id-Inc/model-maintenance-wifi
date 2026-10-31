@@ -278,6 +278,28 @@ def normalized_position_feature(
     return transform.transform(values)
 
 
+def model_position_feature(
+    transform: FittedSpatialTransform,
+    position_raw,
+    *,
+    available: bool,
+    position_weight: float = 1.0,
+):
+    """Return the weighted two-channel position block used in model inputs.
+
+    Geometric normalization stays in ``transform``; this adapter applies the
+    model's independent feature weight after handling unavailable positions.
+    """
+    if not math.isfinite(position_weight) or position_weight < 0.0:
+        raise ValueError("position_weight must be finite and non-negative")
+    normalized = normalized_position_feature(
+        transform,
+        position_raw,
+        available=available,
+    )
+    return normalized * position_weight
+
+
 def _fit_command(args: argparse.Namespace) -> int:
     transform = fit_spatial_transform_from_gf_file(
         args.input,

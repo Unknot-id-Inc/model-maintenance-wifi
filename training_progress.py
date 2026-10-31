@@ -59,3 +59,20 @@ def log_training_epoch(
     suffix = " | " + " | ".join(formatted) if formatted else ""
     print(f"[{stage}] epoch {epoch}/{total_epochs}{suffix}", flush=True)
     return True
+
+
+def log_training_start(stage: str, metrics: Mapping[str, int | float]) -> None:
+    """Print fixed training context once, before the epoch reports begin."""
+    if not stage.strip():
+        raise ValueError("training stage name must not be blank")
+
+    formatted: list[str] = []
+    for name, raw_value in metrics.items():
+        if not name.strip():
+            raise ValueError("training context names must not be blank")
+        if type(raw_value) not in (int, float) or not math.isfinite(float(raw_value)):
+            raise ValueError(f"training context {name!r} must be a finite Python scalar")
+        value = str(raw_value) if type(raw_value) is int else f"{raw_value:.6g}"
+        formatted.append(f"{name}={value}")
+    suffix = " | " + " | ".join(formatted) if formatted else ""
+    print(f"[{stage}] starting{suffix}", flush=True)

@@ -32,6 +32,7 @@ from gufu_artifacts import (
 from training_progress import (
     DEFAULT_LOG_EVERY_K_EPOCHS,
     log_training_epoch,
+    log_training_start,
     validate_log_interval,
 )
 
@@ -1424,6 +1425,15 @@ def train_gnn(
     )
     loss_history: list[float] = []
     model._training_started = True
+    log_training_start(
+        "GNN",
+        {
+            "nodes": graph_state.node_count,
+            "radio_edges": graph_state.physical_edge_count,
+            "virtual_edges": graph_state.virtual_edge_count,
+            "negative_pairs": len(graph_state.negative_pairs),
+        },
+    )
     cuda_devices = []
     if selected_device.type == "cuda":
         cuda_devices = [
@@ -1470,10 +1480,6 @@ def train_gnn(
                 selected_training.epochs,
                 {
                     "loss": loss_history[-1],
-                    "nodes": graph_state.node_count,
-                    "radio_edges": graph_state.physical_edge_count,
-                    "virtual_edges": graph_state.virtual_edge_count,
-                    "negative_pairs": len(graph_state.negative_pairs),
                     "learning_rate": optimizer.param_groups[0]["lr"],
                 },
                 every_k_epochs=log_every_epochs,

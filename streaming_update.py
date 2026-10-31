@@ -39,7 +39,7 @@ from graph_build import (
 )
 from gufu_artifacts import atomic_write_json, canonical_json_digest, read_json_text, sha256_file
 from gufu_data import PreparedDataset, raw_dbm_row_to_ae, rssi_dbm_to_graph_weight
-from spatial_normalization import normalized_position_feature
+from spatial_normalization import model_position_feature
 from rssi_pairs import (
     BoundedNegativeSampler,
     RSSI_SIMILARITY_SPACE,
@@ -444,6 +444,7 @@ class StreamingOnlineGraphManifest(BaseModel):
             "post_transition_ae_reencoded_reference_sample",
             "post_transition_reference_ap_weighted_mean",
             "new_encoder_feature_plus_unavailable_position",
+            "reference_graph_pre_gnn_features",
         ], ...
     ]
     sample_location_initializations: tuple[SampleLocationInitialization, ...]
@@ -672,21 +673,30 @@ def build_streaming_online_graph(
     output_directory: str | Path,
     *,
     virtual_edge_sigma: float,
+    spatial_transform_path_override: str | Path | None = None,
+    reference_node_ids_override: tuple[str, ...] | None = None,
+    reference_node_features_override: np.ndarray | None = None,
     num_workers: int = 4,
     progress_callback: Callable[[str], None] | None = None,
 ) -> StreamingOnlineGraphManifest:
     """Build disk-backed temporary graph state directly from the streamed LP.
 
     The procedure uses exactly the local updater's initialized feature spaces:
-    reference node features come from the selected reference GNN artifact;
+    reference node features come from the selected reference GNN artifact,
+    unless matching pre-GNN node features are supplied as an override;
     update sample/AP features come from ``build_graph_state``; newly measured
-    update radio-edge vectors are endpoint means; virtual similarities use
+    update radio-edge vectors are endpoint means; when a pre-GNN reference
+    override is supplied, LP radio-edge features are also reset to endpoint
+    means so every edge matches the GNN's training input space. Virtual similarities use
     normalized RSSI rows and strict ``cosine > sigma``. Bounded negative pairs
     use the same RSSI rows with a separate conservative threshold. The full
     ``z_encoder || XY`` vectors remain in node and edge features.
     RSSI pair mining uses up to ``num_workers`` processes (default four).
     Accepted virtual-pair records are spooled under the staging directory and
     replayed in stable order while the output arrays are filled.
+    ``spatial_transform_path_override`` lets an evaluator relocate the saved
+    transform after an output directory has been renamed; its contents must
+    still match the identity recorded in the LP input manifest.
     Update evaluation coordinates are not read for labels or initialization.
     """
     if not math.isfinite(virtual_edge_sigma) or not -1.0 <= virtual_edge_sigma <= 1.0:
@@ -694,6 +704,20 @@ def build_streaming_online_graph(
     if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 1:
         raise ValueError("num_workers must be a positive integer")
     input_manifest, mapped = load_streaming_lp_input(reference_lp_input_directory)
+    if (reference_node_ids_override is None) != (reference_node_features_override is None):
+        raise ValueError("reference node feature override requires both node IDs and features")
+    if reference_node_features_override is not None:
+        reference_node_features_override = np.asarray(
+            reference_node_features_override, dtype=np.float64
+        )
+        if reference_node_ids_override != input_manifest.node_ids:
+            raise ValueError("reference feature override IDs/order differ from the LP input")
+        if reference_node_features_override.shape != (
+            len(input_manifest.node_ids), input_manifest.node_feature_dim
+        ):
+            raise ValueError("reference feature override shape differs from the LP input")
+        if not np.isfinite(reference_node_features_override).all():
+            raise ValueError("reference feature override contains non-finite values")
     lp_result = load_streaming_lp_result(
         reference_lp_result_directory,
         input_directory=reference_lp_input_directory,
@@ -731,10 +755,22 @@ def build_streaming_online_graph(
         raise ValueError("streaming updater requires paper cosine-threshold graph configuration")
     if virtual_edge_sigma != input_manifest.graph_build_config.virtual_edge_sigma:
         raise ValueError("online virtual sigma must match the recorded graph configuration")
+    graph_build_config_for_resolution = input_manifest.graph_build_config
+    if spatial_transform_path_override is not None:
+        graph_build_config_for_resolution = graph_build_config_for_resolution.model_copy(
+            update={"spatial_transform_path": str(spatial_transform_path_override)}
+        )
     resolved_build_config, spatial_transform = resolve_spatial_transform(
-        input_manifest.graph_build_config, input_manifest.dataset_id
+        graph_build_config_for_resolution, input_manifest.dataset_id
     )
-    if resolved_build_config != input_manifest.graph_build_config:
+    if (
+        resolved_build_config.model_copy(
+            update={
+                "spatial_transform_path": input_manifest.graph_build_config.spatial_transform_path
+            }
+        )
+        != input_manifest.graph_build_config
+    ):
         raise ValueError("online graph spatial configuration was not fully resolved at bootstrap")
 
     reference_sample_ids = input_manifest.sample_node_ids
@@ -820,10 +856,19 @@ def build_streaming_online_graph(
         )
         node_sources: list[str] = []
         for row, node_id in enumerate(reference_sample_ids):
-            node_features[row] = mapped.node_features[input_rows[node_id]]
+            source_row = input_rows[node_id]
+            node_features[row] = (
+                mapped.node_features[source_row]
+                if reference_node_features_override is None
+                else reference_node_features_override[source_row]
+            )
             sample_signal_features[row] = mapped.sample_signal_features[row]
             sample_signal_masks[row] = mapped.sample_signal_masks[row]
-            node_sources.append("current_reference_gnn_state")
+            node_sources.append(
+                "current_reference_gnn_state"
+                if reference_node_features_override is None
+                else "reference_graph_pre_gnn_features"
+            )
         update_rssi_rows = update_prepared.ae_matrix()
         update_rssi_masks = update_prepared.mask_matrix()
         for node_id in update_sample_ids:
@@ -843,15 +888,13 @@ def build_streaming_online_graph(
             else:
                 # Update truth is unavailable to the GNN. Keep the seeded raw
                 # initialization in metadata, but feed a finite zero block.
-                position_normalized = normalized_position_feature(
+                position_feature = model_position_feature(
                     spatial_transform,
                     position_raw,
                     available=False,
+                    position_weight=input_manifest.graph_build_config.position_weight,
                 )
-                position_feature = tuple(
-                    float(value) * input_manifest.graph_build_config.position_weight
-                    for value in position_normalized
-                )
+                position_feature = tuple(float(value) for value in position_feature)
                 source = "new_encoder_feature_plus_unavailable_position"
             node_features[new_rows[node_id]] = tuple(encoder_row) + tuple(position_feature)
             node_sources.append(source)
@@ -876,8 +919,16 @@ def build_streaming_online_graph(
         for ap_id in ap_ids:
             old_row = input_rows.get(ap_id)
             if ap_id in active_old_ap_ids and old_row is not None:
-                node_features[new_rows[ap_id]] = mapped.node_features[old_row]
-                node_sources.append("current_reference_ap_gnn_state")
+                node_features[new_rows[ap_id]] = (
+                    mapped.node_features[old_row]
+                    if reference_node_features_override is None
+                    else reference_node_features_override[old_row]
+                )
+                node_sources.append(
+                    "current_reference_ap_gnn_state"
+                    if reference_node_features_override is None
+                    else "reference_graph_pre_gnn_features"
+                )
             else:
                 if ap_id not in update_ap_row:
                     raise ValueError(f"new AP {ap_id} has no update-graph initialization")
@@ -917,7 +968,13 @@ def build_streaming_online_graph(
                 sample_id, ap_id = left_id, right_id
             if sample_id not in new_rows or ap_id not in new_rows or ap_id not in active_old_ap_ids:
                 raise ValueError("streamed LP result contains an invalid/inactive radio endpoint")
-            feature = np.asarray(updated_edge_features[index], dtype=np.float64)
+            if reference_node_features_override is None:
+                feature = np.asarray(updated_edge_features[index], dtype=np.float64)
+            else:
+                feature = (
+                    np.asarray(node_features[new_rows[left_id]], dtype=np.float64)
+                    + np.asarray(node_features[new_rows[right_id]], dtype=np.float64)
+                ) / 2.0
             connection.execute(
                 "INSERT INTO radio VALUES (?, ?, ?, ?, ?)",
                 (
@@ -2384,28 +2441,15 @@ def build_streaming_reference_graph_after_transition(
                     node_features[int(row), :latent_dim] = latent[offset]
                     if spatial_transform is None:
                         position_feature = init_by_id[scan_id].xy
-                    elif position_available_by_id[scan_id]:
-                        position_raw = init_by_id[scan_id].xy
-                        position_normalized = normalized_position_feature(
-                            spatial_transform,
-                            position_raw,
-                            available=True,
-                        )
-                        position_feature = tuple(
-                            float(value) * base.graph_build_config.position_weight
-                            for value in position_normalized
-                        )
                     else:
                         position_raw = init_by_id[scan_id].xy
-                        position_normalized = normalized_position_feature(
+                        position_feature = model_position_feature(
                             spatial_transform,
                             position_raw,
-                            available=False,
+                            available=position_available_by_id[scan_id],
+                            position_weight=base.graph_build_config.position_weight,
                         )
-                        position_feature = tuple(
-                            float(value) * base.graph_build_config.position_weight
-                            for value in position_normalized
-                        )
+                        position_feature = tuple(float(value) for value in position_feature)
                     node_features[int(row), latent_dim:] = position_feature
 
         ap_feature_sums = np.zeros((len(ap_ids), feature_dim), dtype=np.float64)

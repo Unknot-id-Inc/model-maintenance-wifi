@@ -36,7 +36,7 @@ from spatial_normalization import (
     FittedSpatialTransform,
     SpatialTransformMetadata,
     load_spatial_transform,
-    normalized_position_feature,
+    model_position_feature,
 )
 
 
@@ -686,6 +686,18 @@ def resolve_spatial_transform(
     return resolved, transform
 
 
+def require_spatial_transform(
+    config: GraphBuildConfig, site_id: str
+) -> tuple[GraphBuildConfig, FittedSpatialTransform]:
+    """Resolve the site's frozen transform or fail instead of using raw XY."""
+    resolved, transform = resolve_spatial_transform(config, site_id)
+    if transform is None:
+        raise GraphConstructionError(
+            "this model path requires an enabled, saved per-site spatial transform"
+        )
+    return resolved, transform
+
+
 def _validate_inputs(
     prepared: PreparedDataset, features: EncoderFeatureArtifact
 ) -> None:
@@ -787,15 +799,13 @@ def build_graph_state(
             position_feature = position_raw
         else:
             position_available = initialization.scan_id in reference_positions
-            position_normalized = normalized_position_feature(
+            position_feature = model_position_feature(
                 spatial_transform,
                 position_raw,
                 available=position_available,
+                position_weight=selected_config.position_weight,
             )
-            position_feature = tuple(
-                float(value) * selected_config.position_weight
-                for value in position_normalized.tolist()
-            )
+            position_feature = tuple(float(value) for value in position_feature.tolist())
         sample_feature_by_id[initialization.scan_id] = (
             feature_by_scan_id[initialization.scan_id] + tuple(position_feature)
         )

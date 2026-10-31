@@ -45,6 +45,7 @@ from sage_ve import (
     load_gnn_features,
     train_gnn,
 )
+from spatial_normalization import fit_spatial_transform
 
 
 AP_A = "001122334455"
@@ -122,10 +123,20 @@ def transition_fixture(tmp_path_factory) -> TransitionFixture:
     update_encoder = encode_prepared_dataset(
         projection, ae_path, root / "update-encoder.json", batch_size=1
     )
+    spatial_path = root / "spatial" / "transition-test.json"
+    fit_spatial_transform(
+        [(position.x, position.y) for position in reference.training_reference_positions()],
+        reference.config.dataset_id,
+        provenance={"source": "test bootstrap training positions"},
+    ).save(spatial_path)
     graph_config = GraphBuildConfig(
         virtual_edge_strategy="paper_cosine_threshold",
-        virtual_edge_sigma=-0.999,
+        virtual_edge_sigma=0.995,
+        negative_similarity_threshold=0.994,
+        minimum_shared_aps=1,
         pseudo_location_seed=9,
+        spatial_normalization_enabled=True,
+        spatial_transform_path=str(spatial_path),
     )
     graph = build_graph_state(reference, reference_encoder, graph_config)
     gnn_path = root / "base-gnn.pt"
@@ -160,7 +171,7 @@ def transition_fixture(tmp_path_factory) -> TransitionFixture:
         gnn_checkpoint_path=gnn_path,
         config=FingerprintUpdateConfig(
             hidden_dim=8,
-            virtual_edge_sigma=-0.999,
+            virtual_edge_sigma=0.995,
             gnn_epochs=1,
             updater_epochs=2,
             ae_epochs=1,

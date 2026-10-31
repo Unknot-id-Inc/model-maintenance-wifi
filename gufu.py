@@ -3,6 +3,7 @@
 # Inputs: the checked-in GUFU text files and the run choices below.
 # Outputs: immutable stage configuration and a reusable, validated run directory.
 
+import hashlib
 import random
 from datetime import datetime
 from pathlib import Path
@@ -13,12 +14,16 @@ import torch
 from ae import AETrainingConfig
 from batch_transition import TransitionConfig
 from fingerprint_update import FingerprintUpdateConfig
-from graph_build import GraphBuildConfig, resolve_spatial_transform
-from gufu_artifacts import atomic_write_json
+from graph_build import (
+    GraphBuildConfig,
+    resolve_spatial_transform,
+)
+from gufu_artifacts import atomic_write_json, sha256_file
 from gufu_data import PreprocessingConfig
 from lp import LinkPredictionConfig
 from pred import OrchestrationConfig
 from sage_ve import GNNModelConfig, GNNTrainingConfig
+from spatial_normalization import load_spatial_transform
 
 # Select "real_dataset" for the normal data/budget configuration or
 # "cpu_smoke" for short CPU training budgets over the same real input files.
@@ -87,7 +92,7 @@ if DATA_PROFILE == "real_dataset":
     )
     UPDATE_CONFIG = FingerprintUpdateConfig(
         alpha=0.5,
-        virtual_edge_sigma=0.9,
+        virtual_edge_sigma=0.95,
         contrastive_temperature=0.1,
         negative_weight=1.0,
         gnn_epochs=50,
@@ -132,7 +137,7 @@ elif DATA_PROFILE == "cpu_smoke":
     UPDATE_CONFIG = FingerprintUpdateConfig(
         hidden_dim=16,
         alpha=0.5,
-        virtual_edge_sigma=0.9,
+        virtual_edge_sigma=0.95,
         contrastive_temperature=0.1,
         negative_weight=1.0,
         gnn_epochs=1,
@@ -162,6 +167,31 @@ if RUN_MODE not in {"stepwise", "full", "lp_streaming"}:
 if DEVICE.startswith("cuda") and not torch.cuda.is_available():
     raise RuntimeError(f"requested CUDA device is unavailable: {DEVICE}")
 
+# Keep each distinct set of source fingerprints in its own output root. This
+# prevents a data edit from resuming bootstrap checkpoints or streaming
+# snapshots produced from the previous version of the files.
+if not BOOTSTRAP_PATH.is_file():
+    raise FileNotFoundError(f"bootstrap fingerprint file is missing: {BOOTSTRAP_PATH}")
+EXPERIMENT_INPUT_PATHS = [BOOTSTRAP_PATH]
+if SELECTED_UPDATE_PATHS is not None:
+    EXPERIMENT_INPUT_PATHS.extend(SELECTED_UPDATE_PATHS)
+elif SELECTED_UPDATE_DIRECTORY is not None:
+    EXPERIMENT_INPUT_PATHS.extend(
+        path
+        for path in SELECTED_UPDATE_DIRECTORY.glob(UPDATE_INPUT_PATTERN)
+        if path.is_file()
+    )
+EXPERIMENT_INPUT_PATHS = sorted(set(EXPERIMENT_INPUT_PATHS), key=lambda path: path.as_posix())
+_input_digest = hashlib.sha256()
+for _input_path in EXPERIMENT_INPUT_PATHS:
+    if not _input_path.is_file():
+        raise FileNotFoundError(f"experiment input file is missing: {_input_path}")
+    _input_digest.update(_input_path.as_posix().encode("utf-8"))
+    _input_digest.update(b"\0")
+    _input_digest.update(sha256_file(_input_path).encode("ascii"))
+    _input_digest.update(b"\n")
+EXPERIMENT_INPUT_TAG = _input_digest.hexdigest()[:16]
+
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -170,14 +200,14 @@ if torch.cuda.is_available():
 if DEVICE == "cpu":
     torch.set_num_threads(1)
 
-# Stable run IDs make cell re-execution reuse the same validated artifacts.
-# Change this string deliberately to create a separate run and train fresh models.
+# Stable run IDs reuse artifacts only for the same configuration and exact input
+# file contents. Dataset edits automatically select a new isolated output root.
 RUN_ID = (
-    f"cpu-smoke-real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v1-softplus-cosine-t0p1-nw1-terminal-node-v1-"
-    f"d{AE_DENSE_WIDTH}-z{AE_LATENT_DIM}-drop{str(AE_DROPOUT_PROBABILITY).replace('.', 'p')}"
+    f"cpu-smoke-real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v2-softplus-cosine-t0p1-nw1-terminal-node-v1-"
+    f"d{AE_DENSE_WIDTH}-z{AE_LATENT_DIM}-drop{str(AE_DROPOUT_PROBABILITY).replace('.', 'p')}-data{EXPERIMENT_INPUT_TAG}"
     if DATA_PROFILE == "cpu_smoke"
-    else f"real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v1-softplus-cosine-t0p1-nw1-terminal-node-v1-"
-    f"d{AE_DENSE_WIDTH}-z{AE_LATENT_DIM}-drop{str(AE_DROPOUT_PROBABILITY).replace('.', 'p')}"
+    else f"real-GF-fingerprint0-ae-v2-{AE_LOSS_RUN_TAG}-rssi-pairs-v1-spatial-v2-softplus-cosine-t0p1-nw1-terminal-node-v1-"
+    f"d{AE_DENSE_WIDTH}-z{AE_LATENT_DIM}-drop{str(AE_DROPOUT_PROBABILITY).replace('.', 'p')}-data{EXPERIMENT_INPUT_TAG}"
 )
 RUN_DIR = Path("output") / "notebook_runs" / DATASET_ID / RUN_ID
 RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -216,16 +246,127 @@ PREPROCESSING_CONFIG = PreprocessingConfig(
     duplicate_bssid_policy="strongest",
     normalization_mode="paper_ae",
 )
+if RUN_MODE == "stepwise":
+    PIPELINE_OUTPUT_ROOT = RUN_DIR / "one_batch_demonstration"
+elif RUN_MODE == "lp_streaming":
+    PIPELINE_OUTPUT_ROOT = RUN_DIR / "streaming_pipeline"
+elif DATA_PROFILE == "cpu_smoke":
+    PIPELINE_OUTPUT_ROOT = RUN_DIR / "cpu_smoke_pipeline"
+else:
+    PIPELINE_OUTPUT_ROOT = Path("output") / "pipelines" / DATASET_ID / RUN_ID
+PIPELINE_RESUME = True
+
+RUN_EVALUATION = True  # Evaluation is an optional, post-update cell 9 action.
+print(f"Profile={DATA_PROFILE}; mode={RUN_MODE}; device={DEVICE}; seed={SEED}")
+print(f"Bootstrap AE training objective={AE_LOSS}")
+print(
+    f"AE architecture settings: dense_width={AE_DENSE_WIDTH}; "
+    f"latent_dim={AE_LATENT_DIM}; dropout_probability={AE_DROPOUT_PROBABILITY}"
+)
+print(
+    f"Training progress: every {LOG_EVERY_K_EPOCHS} epochs, plus each stage's final epoch"
+)
+print(f"RSSI relation mining workers: {RSSI_PAIR_NUM_WORKERS}")
+print(f"Bootstrap input: {BOOTSTRAP_PATH}")
+print(
+    f"Update selection: {SELECTED_UPDATE_PATHS or SELECTED_UPDATE_DIRECTORY} "
+    f"(pattern={UPDATE_INPUT_PATTERN if SELECTED_UPDATE_DIRECTORY else 'explicit one-batch smoke'})"
+)
+print(f"Notebook artifacts: {RUN_DIR}")
+print(f"Source input content tag: {EXPERIMENT_INPUT_TAG}")
+print(f"Pipeline progress log: {PIPELINE_PROGRESS_LOG_PATH}")
+print(f"Sequential pipeline root: {PIPELINE_OUTPUT_ROOT} (resume={PIPELINE_RESUME})")
+
+# %%
+# 2. Prepare/load the authoritative bootstrap dataset
+# Inputs: BOOTSTRAP_PATH and PREPROCESSING_CONFIG from cell 1.
+# Outputs: validated PreparedDataset and PREPARED_PATH; no downstream parser.
+
+from gufu_artifacts import canonical_json_digest
+from gufu_data import (
+    load_prepared_dataset,
+    prepare_dataset_files,
+    save_prepared_dataset,
+)
+
+if not BOOTSTRAP_PATH.is_file():
+    raise FileNotFoundError(f"bootstrap fingerprint file is missing: {BOOTSTRAP_PATH}")
+source_prepared_dataset = prepare_dataset_files(
+    BOOTSTRAP_PATHS, PREPROCESSING_CONFIG, source_root=INPUT_ROOT
+)
+if PREPARED_PATH.is_file():
+    prepared_dataset = load_prepared_dataset(PREPARED_PATH)
+    if canonical_json_digest(prepared_dataset) != canonical_json_digest(
+        source_prepared_dataset
+    ):
+        raise ValueError(
+            "saved prepared artifact no longer matches the selected input/config; "
+            "change RUN_ID for a fresh run"
+        )
+else:
+    prepared_dataset = source_prepared_dataset
+    save_prepared_dataset(prepared_dataset, PREPARED_PATH)
+    prepared_dataset = load_prepared_dataset(PREPARED_PATH)
+
+assert prepared_dataset.config == PREPROCESSING_CONFIG
+assert prepared_dataset.config.batch_role == "bootstrap_reference"
+assert prepared_dataset.bssid_vocabulary == tuple(
+    sorted(prepared_dataset.bssid_vocabulary)
+)
+assert len(prepared_dataset.ap_ids) == len(prepared_dataset.bssid_vocabulary)
+assert len({scan.scan_id for scan in prepared_dataset.scans}) == len(
+    prepared_dataset.scans
+)
+assert all(
+    len(scan.rss_dbm) == len(prepared_dataset.bssid_vocabulary)
+    and len(scan.observation_mask) == len(prepared_dataset.bssid_vocabulary)
+    for scan in prepared_dataset.scans
+)
+print(f"Prepared input: {BOOTSTRAP_PATH} -> {PREPARED_PATH}")
+print(prepared_dataset.summary())
+print(
+    f"Observed measurements={prepared_dataset.stats.observed_readings}; "
+    f"mask shape=({len(prepared_dataset.scans)}, {len(prepared_dataset.bssid_vocabulary)}); "
+    f"dropped rows={prepared_dataset.stats.dropped_records}"
+)
+print(
+    f"Ordered AP IDs: {prepared_dataset.ap_ids[:8]}{' ...' if len(prepared_dataset.ap_ids) > 8 else ''}"
+)
+
+# Fit the coordinate transform from the prepared bootstrap training labels.
+# Keeping it under this content-addressed run root makes it an output of this
+# experiment and prevents changed input files from inheriting old statistics.
+from spatial_normalization import fit_spatial_transform
+
+SPATIAL_TRANSFORM_PATH = RUN_DIR / "artifacts" / "spatial" / f"{DATASET_ID}.json"
+_bootstrap_xy = tuple(
+    (position.x, position.y)
+    for position in prepared_dataset.training_reference_positions()
+)
+_SPATIAL_TRANSFORM = fit_spatial_transform(
+    _bootstrap_xy,
+    DATASET_ID,
+    coordinate_units="unknown",
+    provenance={
+        "bootstrap_batch_id": BOOTSTRAP_BATCH_ID,
+        "prepared_dataset_sha256": canonical_json_digest(prepared_dataset),
+        "bootstrap_input_sha256": sha256_file(BOOTSTRAP_PATH),
+        "run_id": RUN_ID,
+    },
+)
+_SPATIAL_TRANSFORM.save(SPATIAL_TRANSFORM_PATH, overwrite=True)
+print(f"Fitted spatial transform: {SPATIAL_TRANSFORM_PATH}")
+
 GRAPH_CONFIG = GraphBuildConfig(
     virtual_edge_strategy="paper_cosine_threshold",
-    virtual_edge_sigma=0.9,
+    virtual_edge_sigma=0.95,
     similarity_feature_space="normalized_rssi_cosine_min_overlap_v1",
     negative_similarity_threshold=0.5,
     minimum_shared_aps=3,
     max_negative_pairs_per_sample=8,
     pseudo_location_seed=SEED,
     spatial_normalization_enabled=True,
-    spatial_transform_path=str(Path("artifacts") / "spatial" / f"{DATASET_ID}.json"),
+    spatial_transform_path=str(SPATIAL_TRANSFORM_PATH),
     position_weight=1.0,
 )
 GRAPH_CONFIG, _SPATIAL_TRANSFORM = resolve_spatial_transform(GRAPH_CONFIG, DATASET_ID)
@@ -285,96 +426,11 @@ if STREAMING_PIPELINE_CONFIG_PATH.exists():
     )
     if existing_streaming_config != STREAMING_PIPELINE_CONFIG:
         raise ValueError(
-            "streaming pipeline configuration changed for this RUN_ID; choose a new RUN_ID"
+            "saved streaming pipeline config differs for this exact-input run; "
+            "change the run configuration before resuming"
         )
 else:
     atomic_write_json(STREAMING_PIPELINE_CONFIG, STREAMING_PIPELINE_CONFIG_PATH)
-
-if RUN_MODE == "stepwise":
-    PIPELINE_OUTPUT_ROOT = RUN_DIR / "one_batch_demonstration"
-elif RUN_MODE == "lp_streaming":
-    PIPELINE_OUTPUT_ROOT = RUN_DIR / "streaming_pipeline"
-elif DATA_PROFILE == "cpu_smoke":
-    PIPELINE_OUTPUT_ROOT = RUN_DIR / "cpu_smoke_pipeline"
-else:
-    PIPELINE_OUTPUT_ROOT = Path("output") / "pipelines" / DATASET_ID / RUN_ID
-PIPELINE_RESUME = True
-
-RUN_EVALUATION = True  # Evaluation is an optional, post-update cell 9 action.
-print(f"Profile={DATA_PROFILE}; mode={RUN_MODE}; device={DEVICE}; seed={SEED}")
-print(f"Bootstrap AE training objective={AE_LOSS}")
-print(
-    f"AE architecture settings: dense_width={AE_DENSE_WIDTH}; "
-    f"latent_dim={AE_LATENT_DIM}; dropout_probability={AE_DROPOUT_PROBABILITY}"
-)
-print(
-    f"Training progress: every {LOG_EVERY_K_EPOCHS} epochs, plus each stage's final epoch"
-)
-print(f"RSSI relation mining workers: {RSSI_PAIR_NUM_WORKERS}")
-print(f"Bootstrap input: {BOOTSTRAP_PATH}")
-print(
-    f"Update selection: {SELECTED_UPDATE_PATHS or SELECTED_UPDATE_DIRECTORY} "
-    f"(pattern={UPDATE_INPUT_PATTERN if SELECTED_UPDATE_DIRECTORY else 'explicit one-batch smoke'})"
-)
-print(f"Notebook artifacts: {RUN_DIR} (change RUN_ID for a fresh isolated run)")
-print(f"Pipeline progress log: {PIPELINE_PROGRESS_LOG_PATH}")
-print(f"Sequential pipeline root: {PIPELINE_OUTPUT_ROOT} (resume={PIPELINE_RESUME})")
-
-# %%
-# 2. Prepare/load the authoritative bootstrap dataset
-# Inputs: BOOTSTRAP_PATH and PREPROCESSING_CONFIG from cell 1.
-# Outputs: validated PreparedDataset and PREPARED_PATH; no downstream parser.
-
-from gufu_artifacts import canonical_json_digest
-from gufu_data import (
-    load_prepared_dataset,
-    prepare_dataset_files,
-    save_prepared_dataset,
-)
-
-if not BOOTSTRAP_PATH.is_file():
-    raise FileNotFoundError(f"bootstrap fingerprint file is missing: {BOOTSTRAP_PATH}")
-source_prepared_dataset = prepare_dataset_files(
-    BOOTSTRAP_PATHS, PREPROCESSING_CONFIG, source_root=INPUT_ROOT
-)
-if PREPARED_PATH.is_file():
-    prepared_dataset = load_prepared_dataset(PREPARED_PATH)
-    if canonical_json_digest(prepared_dataset) != canonical_json_digest(
-        source_prepared_dataset
-    ):
-        raise ValueError(
-            "saved prepared artifact no longer matches the selected input/config; "
-            "change RUN_ID for a fresh run"
-        )
-else:
-    prepared_dataset = source_prepared_dataset
-    save_prepared_dataset(prepared_dataset, PREPARED_PATH)
-    prepared_dataset = load_prepared_dataset(PREPARED_PATH)
-
-assert prepared_dataset.config == PREPROCESSING_CONFIG
-assert prepared_dataset.config.batch_role == "bootstrap_reference"
-assert prepared_dataset.bssid_vocabulary == tuple(
-    sorted(prepared_dataset.bssid_vocabulary)
-)
-assert len(prepared_dataset.ap_ids) == len(prepared_dataset.bssid_vocabulary)
-assert len({scan.scan_id for scan in prepared_dataset.scans}) == len(
-    prepared_dataset.scans
-)
-assert all(
-    len(scan.rss_dbm) == len(prepared_dataset.bssid_vocabulary)
-    and len(scan.observation_mask) == len(prepared_dataset.bssid_vocabulary)
-    for scan in prepared_dataset.scans
-)
-print(f"Prepared input: {BOOTSTRAP_PATH} -> {PREPARED_PATH}")
-print(prepared_dataset.summary())
-print(
-    f"Observed measurements={prepared_dataset.stats.observed_readings}; "
-    f"mask shape=({len(prepared_dataset.scans)}, {len(prepared_dataset.bssid_vocabulary)}); "
-    f"dropped rows={prepared_dataset.stats.dropped_records}"
-)
-print(
-    f"Ordered AP IDs: {prepared_dataset.ap_ids[:8]}{' ...' if len(prepared_dataset.ap_ids) > 8 else ''}"
-)
 
 # %%
 # 3. Train/load the AE and inspect its complete encoder output
@@ -1152,8 +1208,8 @@ else:
 # localization metric; neither feeds model state.
 
 from fingerprint_update import load_updated_fingerprints
-from gufu_data import load_prepared_dataset
 from gufu_artifacts import atomic_write_bytes, sha256_file
+from gufu_data import load_prepared_dataset
 from gufu_evaluation import (
     compare_streamed_localization_predictions,
     evaluate_measured_reference_rssi,
@@ -1204,7 +1260,9 @@ if RUN_MODE == "lp_streaming":
             scan.scan_id for scan in evaluation_batch.scans
         )
         if not evaluation_batch.evaluation_positions:
-            print("No held-out coordinate labels; localization comparison was not computed.")
+            print(
+                "No held-out coordinate labels; localization comparison was not computed."
+            )
         else:
             update_ids = tuple(updater_manifest["update_ids"])
             updater_stage_metric = evaluate_streamed_update_localization(
@@ -1231,21 +1289,19 @@ if RUN_MODE == "lp_streaming":
             original_reference_ids = original_graph.manifest.labeled_reference_ids
             original_update_ids = original_graph.manifest.update_sample_ids
             if original_update_ids != update_ids:
-                raise ValueError("original fingerprint graph update IDs differ from evaluation batch")
-            original_reference_embeddings = np.asarray(
-                original_graph.node_features[
-                    [original_row[scan_id] for scan_id in original_reference_ids]
-                ],
-                dtype=np.float32,
-            )
-            original_query_rows = [original_row[scan_id] for scan_id in update_ids]
-
+                raise ValueError(
+                    "original fingerprint graph update IDs differ from evaluation batch"
+                )
             source_gnn_checkpoint = snapshot_root / "source_gnn_checkpoint.pt"
-            original_query_embeddings = infer_streaming_gnn_checkpoint_embeddings(
+            original_reference_rows = [
+                original_row[scan_id] for scan_id in original_reference_ids
+            ]
+            original_query_rows = [original_row[scan_id] for scan_id in update_ids]
+            original_pair_embeddings = infer_streaming_gnn_checkpoint_embeddings(
                 original_graph_directory,
                 source_gnn_checkpoint,
                 original_gnn_state.manifest.model_config_record,
-                original_query_rows,
+                original_reference_rows + original_query_rows,
                 expected_checkpoint_sha256=(
                     original_gnn_state.manifest.source_gnn_checkpoint_sha256
                 ),
@@ -1253,6 +1309,12 @@ if RUN_MODE == "lp_streaming":
                 device=DEVICE,
                 temporary_parent=PIPELINE_OUTPUT_ROOT,
             )
+            original_reference_embeddings = original_pair_embeddings[
+                : len(original_reference_rows)
+            ]
+            original_query_embeddings = original_pair_embeddings[
+                len(original_reference_rows) :
+            ]
 
             updated_reference_prepared = load_prepared_dataset(
                 snapshot_root / latest.current_state.reference_prepared,
@@ -1266,21 +1328,43 @@ if RUN_MODE == "lp_streaming":
             updated_reference_graph = load_streaming_online_graph(
                 updated_reference_graph_directory
             )
+            # Snapshot graph configs preserve the path that was valid when the
+            # run was created. Resolve the transform from this snapshot's run
+            # directory so moving/renaming the enclosing output folder is safe.
+            run_root = snapshot_root.parents[2]
+            transform_path = (
+                run_root
+                / "artifacts"
+                / "spatial"
+                / f"{original_graph.manifest.dataset_id}.json"
+            )
+            localization_transform = load_spatial_transform(transform_path)
+            for stage_graph in (original_graph, updated_reference_graph):
+                stage_config = stage_graph.manifest.graph_build_config
+                if (
+                    stage_config.spatial_transform_sha256
+                    != localization_transform.transform_sha256
+                    or stage_config.spatial_transform_metadata
+                    != localization_transform.metadata
+                ):
+                    raise ValueError(
+                        "localization transform does not match the graph's recorded identity"
+                    )
             if (
                 canonical_json_digest(updated_reference_prepared)
                 != updated_reference_graph.manifest.reference_prepared_sha256
             ):
-                raise ValueError("updated reference graph differs from its prepared fingerprints")
+                raise ValueError(
+                    "updated reference graph differs from its prepared fingerprints"
+                )
             updated_reference_gnn = load_streaming_gnn_state(
                 snapshot_root / latest.current_state.reference_gnn,
                 updated_reference_graph_directory,
                 device=DEVICE,
             )
-            updated_reference_row = {
-                node_id: row
-                for row, node_id in enumerate(updated_reference_gnn.manifest.node_ids)
-            }
-            updated_reference_ids = updated_reference_graph.manifest.labeled_reference_ids
+            updated_reference_ids = (
+                updated_reference_graph.manifest.labeled_reference_ids
+            )
             original_coordinates_by_id = dict(
                 zip(
                     original_reference_ids,
@@ -1294,22 +1378,23 @@ if RUN_MODE == "lp_streaming":
                 )
             )
             if original_coordinates_by_id != updated_coordinates_by_id:
-                raise ValueError("bootstrap localization labels changed across fingerprint transition")
+                raise ValueError(
+                    "bootstrap localization labels changed across fingerprint transition"
+                )
             reference_coordinates = np.asarray(
-                [original_coordinates_by_id[scan_id] for scan_id in original_reference_ids],
-                dtype=np.float32,
+                [
+                    original_coordinates_by_id[scan_id]
+                    for scan_id in original_reference_ids
+                ],
+                dtype=np.float64,
             )
             updated_reference_coordinates = np.asarray(
-                [updated_coordinates_by_id[scan_id] for scan_id in updated_reference_ids],
-                dtype=np.float32,
-            )
-            updated_reference_embeddings = np.asarray(
-                updated_reference_gnn.node_embeddings[
-                    [updated_reference_row[scan_id] for scan_id in updated_reference_ids]
+                [
+                    updated_coordinates_by_id[scan_id]
+                    for scan_id in updated_reference_ids
                 ],
-                dtype=np.float32,
+                dtype=np.float64,
             )
-
             with tempfile.TemporaryDirectory(
                 prefix="gufu-localization-evaluation-",
                 dir=PIPELINE_OUTPUT_ROOT,
@@ -1325,7 +1410,9 @@ if RUN_MODE == "lp_streaming":
                     batch_size=latest.pipeline_config.encoder_batch_size,
                     device=DEVICE,
                 )
-                updated_lp_result_directory = evaluation_temp / "updated_reference_lp_result"
+                updated_lp_result_directory = (
+                    evaluation_temp / "updated_reference_lp_result"
+                )
                 predict_edges_streaming(
                     snapshot_root / latest.current_state.reference_lp_input,
                     updated_lp_result_directory,
@@ -1340,6 +1427,7 @@ if RUN_MODE == "lp_streaming":
                     updated_query_encoder,
                     updated_query_graph_directory,
                     virtual_edge_sigma=latest.pipeline_config.graph_build.virtual_edge_sigma,
+                    spatial_transform_path_override=transform_path,
                     num_workers=latest.pipeline_config.rssi_pair_num_workers,
                     progress_callback=_report_pipeline_progress,
                 )
@@ -1351,23 +1439,42 @@ if RUN_MODE == "lp_streaming":
                     for row, node_id in enumerate(updated_query_graph.manifest.node_ids)
                 }
                 if updated_query_graph.manifest.update_sample_ids != update_ids:
-                    raise ValueError("updated fingerprint graph update IDs differ from evaluation batch")
-                updated_vocabulary_size = len(updated_query_graph.manifest.bssid_vocabulary)
-                updated_vocabulary_sha256 = updated_query_graph.manifest.vocabulary_sha256
-                updated_query_embeddings = infer_streaming_gnn_embeddings(
+                    raise ValueError(
+                        "updated fingerprint graph update IDs differ from evaluation batch"
+                    )
+                updated_vocabulary_size = len(
+                    updated_query_graph.manifest.bssid_vocabulary
+                )
+                updated_vocabulary_sha256 = (
+                    updated_query_graph.manifest.vocabulary_sha256
+                )
+                updated_reference_rows_in_query = [
+                    updated_query_row[scan_id] for scan_id in updated_reference_ids
+                ]
+                updated_query_rows = [
+                    updated_query_row[scan_id] for scan_id in update_ids
+                ]
+                updated_pair_embeddings = infer_streaming_gnn_embeddings(
                     updated_query_graph_directory,
                     updated_reference_gnn.model,
-                    [updated_query_row[scan_id] for scan_id in update_ids],
+                    updated_reference_rows_in_query + updated_query_rows,
                     chunk_size=latest.pipeline_config.gnn_chunk_size,
                     device=DEVICE,
                     temporary_parent=PIPELINE_OUTPUT_ROOT,
                 )
+                updated_reference_embeddings = updated_pair_embeddings[
+                    : len(updated_reference_rows_in_query)
+                ]
+                updated_query_embeddings = updated_pair_embeddings[
+                    len(updated_reference_rows_in_query) :
+                ]
 
             localization_config = latest.pipeline_config.fingerprint_update
             original_predictions = train_reference_location_mlp_predictions(
                 original_reference_embeddings,
                 reference_coordinates,
                 original_query_embeddings,
+                spatial_transform=localization_transform,
                 hidden_dim=localization_config.hidden_dim,
                 epochs=localization_config.updater_epochs,
                 learning_rate=localization_config.updater_learning_rate,
@@ -1378,6 +1485,7 @@ if RUN_MODE == "lp_streaming":
                 updated_reference_embeddings,
                 updated_reference_coordinates,
                 updated_query_embeddings,
+                spatial_transform=localization_transform,
                 hidden_dim=localization_config.hidden_dim,
                 epochs=localization_config.updater_epochs,
                 learning_rate=localization_config.updater_learning_rate,
@@ -1399,7 +1507,9 @@ if RUN_MODE == "lp_streaming":
                 "updated_gnn_checkpoint_sha256": updated_reference_gnn.manifest.checkpoint_sha256,
                 "source_ae_checkpoint_sha256": latest.source_ae_checkpoint_sha256,
                 "updated_ae_checkpoint_sha256": latest.resulting_ae_checkpoint_sha256,
-                "original_vocabulary_size": len(original_graph.manifest.bssid_vocabulary),
+                "original_vocabulary_size": len(
+                    original_graph.manifest.bssid_vocabulary
+                ),
                 "original_vocabulary_sha256": original_graph.manifest.vocabulary_sha256,
                 "updated_vocabulary_size": updated_vocabulary_size,
                 "updated_vocabulary_sha256": updated_vocabulary_sha256,
@@ -1412,11 +1522,15 @@ if RUN_MODE == "lp_streaming":
                     "seed": localization_config.seed,
                     "held_out_coordinates_used_for_training": False,
                 },
-                "updater_stage_diagnostic": updater_stage_metric.model_dump(mode="json"),
+                "updater_stage_diagnostic": updater_stage_metric.model_dump(
+                    mode="json"
+                ),
                 "paired_comparison": localization_comparison,
             }
             report_directory = (
-                PIPELINE_OUTPUT_ROOT / "evaluation" / latest.snapshot_id.split(":", 1)[1]
+                PIPELINE_OUTPUT_ROOT
+                / "evaluation"
+                / latest.snapshot_id.split(":", 1)[1]
             )
             atomic_write_json(
                 report,

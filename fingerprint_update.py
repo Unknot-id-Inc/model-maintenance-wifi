@@ -21,7 +21,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor, nn
 
 from ae import AE, EncoderFeatureArtifact, load_ae_checkpoint
-from graph_build import GraphBuildConfig, GraphState, build_graph_state
+from graph_build import (
+    GraphBuildConfig,
+    GraphState,
+    build_graph_state,
+    require_spatial_transform,
+)
 from rssi_pairs import (
     NegativeSamplePair,
     RSSI_SIMILARITY_SPACE,
@@ -53,9 +58,10 @@ from sage_ve import (
     load_gnn_checkpoint,
 )
 from training_progress import DEFAULT_LOG_EVERY_K_EPOCHS, log_training_epoch, validate_log_interval
+from spatial_normalization import FittedSpatialTransform
 
 
-UPDATE_CHECKPOINT_FORMAT = "gufu_fingerprint_update_checkpoint_v5"
+UPDATE_CHECKPOINT_FORMAT = "gufu_fingerprint_update_checkpoint_v6"
 UPDATE_ARTIFACT_FORMAT = "gufu_updated_fingerprints_v1"
 GRAPH_DIM = 34
 ENCODER_DIM = 32
@@ -77,9 +83,6 @@ class FingerprintUpdateConfig(BaseModel):
     contrastive_temperature: float = Field(default=0.1, gt=0.0)
     adjacency_policy: Literal["row_normalized_cross_virtual_v1"] = (
         "row_normalized_cross_virtual_v1"
-    )
-    location_scaling: Literal["bootstrap_label_axis_minmax_v1"] = (
-        "bootstrap_label_axis_minmax_v1"
     )
     gnn_epochs: int = Field(default=1, ge=1)
     updater_epochs: int = Field(default=100, ge=1)
@@ -113,42 +116,6 @@ class FingerprintUpdateConfig(BaseModel):
             if not math.isfinite(getattr(self, key)):
                 raise ValueError(f"{key} must be finite")
         return self
-
-
-class UpdateLocationScaler(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-
-    x_min: float
-    x_max: float
-    y_min: float
-    y_max: float
-    policy: Literal["bootstrap_label_axis_minmax_v1"] = (
-        "bootstrap_label_axis_minmax_v1"
-    )
-
-    @model_validator(mode="after")
-    def finite_ordered(self):
-        values = (self.x_min, self.x_max, self.y_min, self.y_max)
-        if not all(math.isfinite(value) for value in values):
-            raise ValueError("coordinate scaling values must be finite")
-        if self.x_max < self.x_min or self.y_max < self.y_min:
-            raise ValueError("coordinate scaler maxima must not be below minima")
-        return self
-
-    def encode(self, coordinates: Tensor) -> Tensor:
-        spans = coordinates.new_tensor(
-            (self.x_max - self.x_min, self.y_max - self.y_min)
-        )
-        minima = coordinates.new_tensor((self.x_min, self.y_min))
-        safe_spans = torch.where(spans == 0, torch.ones_like(spans), spans)
-        return (coordinates - minima) / safe_spans
-
-    def decode(self, coordinates: Tensor) -> Tensor:
-        spans = coordinates.new_tensor(
-            (self.x_max - self.x_min, self.y_max - self.y_min)
-        )
-        minima = coordinates.new_tensor((self.x_min, self.y_min))
-        return minima + coordinates * spans
 
 
 class OnlineRadioEdge(BaseModel):
@@ -443,7 +410,7 @@ class UpdateEpochLoss(BaseModel):
 class FingerprintUpdateManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_fingerprint_update_checkpoint_v5"] = UPDATE_CHECKPOINT_FORMAT
+    format: Literal["gufu_fingerprint_update_checkpoint_v6"] = UPDATE_CHECKPOINT_FORMAT
     run_id: str
     config: FingerprintUpdateConfig
     dataset_id: str
@@ -469,14 +436,16 @@ class FingerprintUpdateManifest(BaseModel):
     graph_input_space: Literal[
         "z_online_gnn_input_34d", "z_online_gnn_input_v1"
     ] = "z_online_gnn_input_v1"
-    location_target_space: Literal["bootstrap_axis_minmax_2d"] = "bootstrap_axis_minmax_2d"
+    location_target_space: Literal[
+        "site_unique_centroid_max_radius_2d"
+    ] = "site_unique_centroid_max_radius_2d"
+    spatial_transform_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     decoder_input_space: Literal["z_update_mlp_32d", "z_update_mlp_v1"] = "z_update_mlp_v1"
     reference_node_ids: tuple[str, ...]
     update_node_ids: tuple[str, ...]
     labeled_reference_ids: tuple[str, ...]
     adjacency_shape: tuple[int, int]
     adjacency_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    location_scaler: UpdateLocationScaler
     loss_history: tuple[UpdateEpochLoss, ...]
     gnn_loss_history: tuple[float, ...]
     ae_loss_history: tuple[float, ...]
@@ -655,12 +624,12 @@ class FingerprintUpdateContext:
     online_graph: OnlineUpdateGraph
     tensors: GraphTensorInput
     labeled_reference_ids: tuple[str, ...]
-    reference_coordinates: Tensor
+    reference_coordinates_raw: Tensor
     update_encoder_targets: Tensor
     update_ae_inputs: Tensor
     reference_ae_inputs: Tensor
     adjacency: Tensor
-    location_scaler: UpdateLocationScaler
+    spatial_transform: FittedSpatialTransform
     source_ae_checkpoint_sha256: str
     source_gnn_checkpoint_sha256: str
     reference_prepared_sha256: str
@@ -690,7 +659,7 @@ class FingerprintUpdateTrainingResult:
 
 
 class LocationPredictor(nn.Module):
-    """MLP 1: final GNN sample feature to scaled 2-D location."""
+    """MLP 1: final GNN sample feature to normalized 2-D location."""
 
     def __init__(self, hidden_dim: int, graph_feature_dim: int = GRAPH_DIM):
         super().__init__()
@@ -723,10 +692,10 @@ class LocationToFeatureUpdater(nn.Module):
             nn.Linear(hidden_dim, output_feature_dim),
         )
 
-    def forward(self, scaled_coordinates: Tensor) -> Tensor:
-        if scaled_coordinates.ndim != 2 or scaled_coordinates.shape[1] != COORD_DIM:
-            raise ValueError("feature updater expects [samples,2] scaled coordinates")
-        return self.layers(scaled_coordinates)
+    def forward(self, normalized_coordinates: Tensor) -> Tensor:
+        if normalized_coordinates.ndim != 2 or normalized_coordinates.shape[1] != COORD_DIM:
+            raise ValueError("feature updater expects [samples,2] normalized coordinates")
+        return self.layers(normalized_coordinates)
 
 
 def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float | None:
@@ -1043,17 +1012,6 @@ def _online_graph_tensors(graph: OnlineUpdateGraph) -> GraphTensorInput:
     )
 
 
-def _location_scaler(coordinates: Tensor) -> UpdateLocationScaler:
-    if coordinates.ndim != 2 or coordinates.shape[1] != 2 or coordinates.shape[0] < 1:
-        raise ValueError("at least one labeled bootstrap coordinate is required")
-    return UpdateLocationScaler(
-        x_min=float(coordinates[:, 0].min()),
-        x_max=float(coordinates[:, 0].max()),
-        y_min=float(coordinates[:, 1].min()),
-        y_max=float(coordinates[:, 1].max()),
-    )
-
-
 def cross_virtual_adjacency(
     graph: OnlineUpdateGraph,
     *,
@@ -1106,6 +1064,11 @@ def prepare_fingerprint_update(
         raise ValueError("reference graph does not match reference prepared data")
     if reference_graph.dataset_id != reference_prepared.config.dataset_id:
         raise ValueError("reference graph dataset identity does not match")
+    resolved_graph_config, spatial_transform = require_spatial_transform(
+        reference_graph.build_config, reference_prepared.config.dataset_id
+    )
+    if resolved_graph_config != reference_graph.build_config:
+        raise ValueError("reference graph spatial transform configuration is not resolved")
     if reference_prepared.bssid_vocabulary != update_prepared.bssid_vocabulary:
         raise ValueError("no-vocabulary-change update requires exactly the same ordered BSSID vocabulary")
     if reference_prepared.config.normalization_mode != update_prepared.config.normalization_mode:
@@ -1184,8 +1147,7 @@ def prepare_fingerprint_update(
     )
     if labeled_ids != online_graph.labeled_reference_ids:
         raise ValueError("bootstrap training labels disagree with graph label masks")
-    coords = torch.tensor([coords_by_id[scan_id] for scan_id in labeled_ids], dtype=torch.float32)
-    scaler = _location_scaler(coords)
+    coords = torch.tensor([coords_by_id[scan_id] for scan_id in labeled_ids], dtype=torch.float64)
     encoder_ref_by_id = {
         scan_id: reference_encoder_features.feature_matrix[row]
         for row, scan_id in enumerate(reference_encoder_features.scan_ids)
@@ -1226,7 +1188,7 @@ def prepare_fingerprint_update(
         online_graph=online_graph,
         tensors=tensors,
         labeled_reference_ids=labeled_ids,
-        reference_coordinates=coords,
+        reference_coordinates_raw=coords,
         update_encoder_targets=torch.tensor(
             [encoder_update_by_id[scan_id] for scan_id in update_ids], dtype=torch.float32
         ),
@@ -1237,7 +1199,7 @@ def prepare_fingerprint_update(
             [reference_values_by_id[scan_id] for scan_id in labeled_ids], dtype=torch.float32
         ).unsqueeze(1),
         adjacency=adjacency,
-        location_scaler=scaler,
+        spatial_transform=spatial_transform,
         source_ae_checkpoint_sha256=ae_checkpoint.checkpoint_sha256,
         source_gnn_checkpoint_sha256=gnn_checkpoint.checkpoint_sha256,
         reference_prepared_sha256=ref_prepared_hash,
@@ -1253,7 +1215,7 @@ def compute_update_losses(
     feature_model: nn.Module,
     reference_gnn_features: Tensor,
     update_gnn_features: Tensor,
-    reference_coordinates_scaled: Tensor,
+    reference_coordinates_normalized: Tensor,
     update_encoder_targets: Tensor,
     adjacency_update_reference: Tensor,
     *,
@@ -1263,7 +1225,7 @@ def compute_update_losses(
     if not 0.0 <= alpha <= 1.0 or not math.isfinite(alpha):
         raise ValueError("alpha must be finite and in [0,1]")
     k = update_gnn_features.shape[0]
-    n = reference_coordinates_scaled.shape[0]
+    n = reference_coordinates_normalized.shape[0]
     if adjacency_update_reference.shape != (k, n):
         raise ValueError("A must have shape [num_update_scans,num_labeled_refs]")
     graph_dim = reference_gnn_features.shape[1] if reference_gnn_features.ndim == 2 else 0
@@ -1278,15 +1240,15 @@ def compute_update_losses(
         raise ValueError("location predictor width is incompatible with graph features")
     if getattr(feature_model, "output_feature_dim", encoder_dim) != encoder_dim:
         raise ValueError("feature updater width is incompatible with encoder targets")
-    if reference_coordinates_scaled.shape != (n, COORD_DIM):
-        raise ValueError("scaled bootstrap coordinates must be [N_ref,2]")
+    if reference_coordinates_normalized.shape != (n, COORD_DIM):
+        raise ValueError("normalized bootstrap coordinates must be [N_ref,2]")
 
     predicted_reference_xy = location_model(reference_gnn_features)
     predicted_update_xy = location_model(update_gnn_features)
-    predicted_reference_z = feature_model(reference_coordinates_scaled)
+    predicted_reference_z = feature_model(reference_coordinates_normalized)
     predicted_update_z = feature_model(predicted_update_xy)
     location_supervised = torch.linalg.vector_norm(
-        predicted_reference_xy - reference_coordinates_scaled
+        predicted_reference_xy - reference_coordinates_normalized
     )
     feature_supervised = torch.linalg.vector_norm(
         predicted_update_z - update_encoder_targets
@@ -1294,7 +1256,7 @@ def compute_update_losses(
     nonempty = adjacency_update_reference.sum(dim=1) > 0
     if bool(nonempty.any()):
         location_consistency = torch.linalg.vector_norm(
-            adjacency_update_reference[nonempty] @ reference_coordinates_scaled
+            adjacency_update_reference[nonempty] @ reference_coordinates_normalized
             - predicted_update_xy[nonempty]
         )
         feature_consistency = torch.linalg.vector_norm(
@@ -1392,7 +1354,12 @@ def _tensor_ids(graph: OnlineUpdateGraph, ids: tuple[str, ...], features: Tensor
 
 
 def _coordinate_training_tensors(context: FingerprintUpdateContext) -> tuple[Tensor, Tensor]:
-    return context.location_scaler.encode(context.reference_coordinates), context.adjacency
+    return (
+        context.spatial_transform.transform(context.reference_coordinates_raw).to(
+            dtype=torch.float32
+        ),
+        context.adjacency,
+    )
 
 
 def _seeded_clone_gnn(loaded: LoadedGNNCheckpoint, seed: int) -> EdgeFeatureSAGE:
@@ -1521,8 +1488,8 @@ def _train_updaters(
         context.online_graph.update_sample_ids,
         gnn_output,
     )
-    y_ref, adjacency = _coordinate_training_tensors(context)
-    y_ref = y_ref.to(device)
+    reference_coordinates_normalized, adjacency = _coordinate_training_tensors(context)
+    reference_coordinates_normalized = reference_coordinates_normalized.to(device)
     adjacency = adjacency.to(device)
     z_update = context.update_encoder_targets.to(device).detach()
     location_model = LocationPredictor(
@@ -1550,7 +1517,7 @@ def _train_updaters(
                 feature_model,
                 reference_features,
                 update_features,
-                y_ref,
+                reference_coordinates_normalized,
                 z_update,
                 adjacency,
                 alpha=config.alpha,
@@ -1587,7 +1554,7 @@ def _train_updaters(
     location_model.eval()
     feature_model.eval()
     with torch.no_grad():
-        reference_z = feature_model(y_ref).detach().clone()
+        reference_z = feature_model(reference_coordinates_normalized).detach().clone()
     return location_model, feature_model, tuple(history), optimizer.state_dict(), reference_z
 
 
@@ -1649,7 +1616,6 @@ def _train_update_ae(
 def _build_manifest(
     context: FingerprintUpdateContext,
     config: FingerprintUpdateConfig,
-    location_scaler: UpdateLocationScaler,
     losses: tuple[UpdateEpochLoss, ...],
     gnn_history: tuple[float, ...],
     ae_history: tuple[float, ...],
@@ -1682,12 +1648,12 @@ def _build_manifest(
         normalization=context.reference_graph.normalization,
         encoder_feature_dim=context.online_graph.encoder_feature_dim,
         graph_feature_dim=context.online_graph.node_feature_dim,
+        spatial_transform_sha256=context.spatial_transform.transform_sha256,
         reference_node_ids=context.reference_graph.sample_node_ids,
         update_node_ids=context.online_graph.update_sample_ids,
         labeled_reference_ids=context.labeled_reference_ids,
         adjacency_shape=tuple(context.adjacency.shape),
         adjacency_sha256=hashlib.sha256(adjacency_bytes).hexdigest(),
-        location_scaler=location_scaler,
         loss_history=losses,
         gnn_loss_history=gnn_history,
         ae_loss_history=ae_history,
@@ -1760,17 +1726,19 @@ def _predict_artifact(
             dtype=torch.long,
             device=device,
         )
-        predicted_scaled_xy = models.location_model(
+        predicted_normalized_xy = models.location_model(
             online_gnn.index_select(0, update_rows)
         )
-        predicted_xy = context.location_scaler.decode(predicted_scaled_xy)
-        reference_xy = context.reference_coordinates.to(device)
-        scaled_xy = context.location_scaler.encode(reference_xy)
-        update_z = models.feature_model(scaled_xy)
+        predicted_raw_xy = context.spatial_transform.inverse_transform(predicted_normalized_xy)
+        reference_xy = context.reference_coordinates_raw.to(device)
+        reference_normalized_xy = context.spatial_transform.transform(reference_xy).to(
+            dtype=next(models.feature_model.parameters()).dtype
+        )
+        update_z = models.feature_model(reference_normalized_xy)
         decoded = models.ae_model.D(update_z.unsqueeze(1))[:, 0, :]
         normalized = decoded.cpu().tolist()
         latent_rows = update_z.cpu().tolist()
-        predicted_rows = predicted_xy.cpu().tolist()
+        predicted_rows = predicted_raw_xy.cpu().tolist()
 
     original_positions = {
         position.scan_id: (position.x, position.y)
@@ -1873,6 +1841,8 @@ def train_fingerprint_update(
             raise ValueError("previous updater checkpoint belongs to a different dataset")
         if prior_manifest.reference_batch_id != context.reference_prepared.config.batch_id:
             raise ValueError("previous updater checkpoint belongs to a different reference batch")
+        if prior_manifest.spatial_transform_sha256 != context.spatial_transform.transform_sha256:
+            raise ValueError("previous updater checkpoint uses a different spatial transform")
         if prior_manifest.normalization != context.reference_prepared.config.normalization_mode:
             raise ValueError("previous updater checkpoint uses a different normalization")
         if prior_manifest.config.hidden_dim != selected.hidden_dim:
@@ -1914,7 +1884,6 @@ def train_fingerprint_update(
     manifest = _build_manifest(
         context,
         selected,
-        context.location_scaler,
         updater_history,
         gnn_history,
         ae_history,
@@ -1964,6 +1933,7 @@ def load_fingerprint_update_checkpoint(
         (manifest.source_gnn_checkpoint_sha256 == context.source_gnn_checkpoint_sha256, "GNN checkpoint"),
         (manifest.vocabulary_sha256 == context.reference_graph.vocabulary_sha256, "vocabulary"),
         (manifest.adjacency_sha256 == hashlib.sha256(context.adjacency.cpu().contiguous().numpy().tobytes()).hexdigest(), "adjacency"),
+        (manifest.spatial_transform_sha256 == context.spatial_transform.transform_sha256, "spatial transform"),
     )
     for compatible, label in checks:
         if not compatible:
@@ -2054,7 +2024,6 @@ __all__ = [
     "LocationPredictor",
     "LocationToFeatureUpdater",
     "OnlineUpdateGraph",
-    "UpdateLocationScaler",
     "UpdatedFingerprintArtifact",
     "PredictedUpdateLocation",
     "compute_ae_update_losses",

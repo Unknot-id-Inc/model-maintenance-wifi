@@ -29,7 +29,7 @@ from ae import (
 )
 from batch_transition import TransitionConfig, project_prepared_batch_to_vocabulary
 from fingerprint_update import FingerprintUpdateConfig
-from graph_build import GraphBuildConfig
+from graph_build import GraphBuildConfig, require_spatial_transform
 from gufu_artifacts import (
     atomic_write_json,
     canonical_json_digest,
@@ -65,6 +65,7 @@ from streaming_fingerprint_update import (
 )
 from streaming_gnn import (
     StreamingGNNState,
+    infer_streaming_gnn_state,
     load_streaming_gnn_state,
     train_streaming_gnn,
 )
@@ -381,7 +382,10 @@ def _validate_bootstrap(
     ae = load_ae_checkpoint(ae_checkpoint_path, prepared, device=config.device)
     input_manifest, _ = load_streaming_lp_input(lp_input_directory)
     ids = tuple(scan.scan_id for scan in prepared.scans)
-    configured_graph = config.graph_build.model_dump(mode="json")
+    resolved_graph_config, _ = require_spatial_transform(
+        config.graph_build, config.dataset_id
+    )
+    configured_graph = resolved_graph_config.model_dump(mode="json")
     input_graph = input_manifest.graph_build_config.model_dump(mode="json")
     configured_bounds = configured_graph.pop("pseudo_location_bounds")
     input_bounds = input_graph.pop("pseudo_location_bounds")
@@ -593,10 +597,7 @@ def _process_batch(
     )
     if progress_callback is not None:
         progress_callback(
-            f"[pipeline] batch {batch_id}: online graph ready: "
-            f"nodes={len(online_graph_manifest.node_ids):,}, "
-            f"radio edges={online_graph_manifest.radio_edge_count:,}, "
-            f"virtual edges={online_graph_manifest.virtual_edge_count:,}"
+            f"[pipeline] batch {batch_id}: online graph ready; starting GNN training"
         )
     _stage_call(stage_observer, "update_graph_aggregation", staging, records, "online_graph")
 
@@ -615,12 +616,18 @@ def _process_batch(
     )
     _stage_call(stage_observer, "update_gnn_training", staging, records, "online_gnn")
 
-    warm_start = (None, None, None)
+    warm_start = (None, None, None, None)
     if state.updater_directory is not None:
+        spatial_transform_sha256 = (
+            online_graph_manifest.graph_build_config.spatial_transform_sha256
+        )
+        if spatial_transform_sha256 is None:
+            raise ValueError("streaming updater requires a saved spatial transform")
         warm_start = load_streaming_updater_warm_start(
             state.updater_directory,
             graph_feature_dim=online_graph_manifest.node_feature_dim,
             encoder_feature_dim=online_graph_manifest.encoder_feature_dim,
+            spatial_transform_sha256=spatial_transform_sha256,
         )
     updater_path = staging / "updaters"
     updaters = train_streaming_updaters(
@@ -635,8 +642,9 @@ def _process_batch(
             source_ae_checkpoint, state.prepared, device="cpu"
         ).checkpoint_sha256,
         source_updater_id=warm_start[0],
-        initial_location_state=warm_start[1],
-        initial_feature_state=warm_start[2],
+        source_updater_spatial_transform_sha256=warm_start[1],
+        initial_location_state=warm_start[2],
+        initial_feature_state=warm_start[3],
         chunk_size=config.updater_chunk_size,
         device=config.device,
         log_every_epochs=config.log_every_epochs,
@@ -792,6 +800,135 @@ def _process_batch(
         != transitioned_prepared.bssid_vocabulary
     ):
         raise ValueError("post-transition LP state failed reference identity validation")
+
+    # A second Eq. (5)--(10) update round uses one-pass final-GNN embeddings
+    # for both the retained references and incoming scans. It is published as
+    # a comparison candidate; the current pipeline state remains the first
+    # post-transition AE result because the persisted reference GNN was trained
+    # against that representation.
+    round2_root = staging / "post_transition_fingerprint_update_round2"
+    round2_root.mkdir()
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: building second fingerprint-update round"
+        )
+    round2_update = project_prepared_batch_to_vocabulary(
+        full_update, transitioned_prepared.bssid_vocabulary
+    )
+    round2_update_encoder = encode_prepared_dataset(
+        round2_update,
+        post_transition_ae_path / "post_transition_ae.pt",
+        round2_root / "update_encoder_features.json",
+        batch_size=config.encoder_batch_size,
+        device=config.device,
+    )
+    round2_lp_result_path = round2_root / "query_link_prediction_result"
+    predict_edges_streaming(
+        reference_lp_path,
+        round2_lp_result_path,
+        config.link_prediction,
+        progress_callback=progress_callback,
+    )
+    reference_graph_state = load_streaming_online_graph(reference_graph_path)
+    round2_graph_path = round2_root / "query_graph"
+    round2_graph_manifest = build_streaming_online_graph(
+        reference_lp_path,
+        round2_lp_result_path,
+        round2_update,
+        round2_update_encoder,
+        round2_graph_path,
+        virtual_edge_sigma=config.graph_build.virtual_edge_sigma,
+        reference_node_ids_override=reference_graph_state.manifest.node_ids,
+        reference_node_features_override=reference_graph_state.node_features,
+        num_workers=config.rssi_pair_num_workers,
+        progress_callback=progress_callback,
+    )
+    _stage_call(
+        stage_observer,
+        "update_post_transition_query_graph",
+        staging,
+        records,
+        "post_transition_fingerprint_update_round2/query_graph",
+    )
+    round2_gnn_state = infer_streaming_gnn_state(
+        round2_graph_path,
+        final_gnn,
+        round2_root / "query_gnn",
+        chunk_size=config.gnn_chunk_size,
+        device=config.device,
+    )
+    round2_update_config = config.fingerprint_update.model_copy(
+        update={"seed": config.fingerprint_update.seed + seq * 100003 + 2}
+    )
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: training second-round location/feature updater"
+        )
+    round2_updaters = train_streaming_updaters(
+        round2_graph_path,
+        round2_gnn_state,
+        transitioned_prepared,
+        round2_update,
+        round2_update_encoder,
+        round2_root / "updaters",
+        round2_update_config,
+        source_ae_checkpoint_sha256=post_transition_ae.manifest.checkpoint_sha256,
+        chunk_size=config.updater_chunk_size,
+        device=config.device,
+        log_every_epochs=config.log_every_epochs,
+    )
+    _stage_call(
+        stage_observer,
+        "update_second_location_feature_updaters",
+        staging,
+        records,
+        "post_transition_fingerprint_update_round2/updaters",
+    )
+    if progress_callback is not None:
+        progress_callback(
+            f"[pipeline] batch {batch_id}: running second-round AE Eq. (10) update"
+        )
+    round2_ae_update = train_streaming_ae_update(
+        transitioned_prepared,
+        round2_update,
+        post_transition_ae_path / "post_transition_ae.pt",
+        round2_updaters,
+        round2_root / "ae_update",
+        round2_update_config,
+        chunk_size=config.ae_chunk_size,
+        device=config.device,
+        log_every_epochs=config.log_every_epochs,
+    )
+    _stage_call(
+        stage_observer,
+        "update_second_ae_eq10",
+        staging,
+        records,
+        "post_transition_fingerprint_update_round2/ae_update",
+    )
+    round2_manifest = {
+        "format": "gufu_post_transition_fingerprint_update_round2_v1",
+        "role": "comparison_candidate",
+        "round1_reference_prepared_sha256": canonical_json_digest(transitioned_prepared),
+        "reference_scan_ids": tuple(scan.scan_id for scan in transitioned_prepared.scans),
+        "bssid_vocabulary": transitioned_prepared.bssid_vocabulary,
+        "query_graph_id": round2_graph_manifest.online_graph_id,
+        "query_gnn_artifact_id": round2_gnn_state.manifest.artifact_id,
+        "updater_id": round2_updaters.manifest.updater_id,
+        "ae_update_id": round2_ae_update.manifest.update_id,
+        "ae_update_directory": "ae_update",
+        "updated_rssi_dbm_sha256": sha256_file(
+            round2_root / "ae_update" / "updated_rssi_dbm.npy"
+        ),
+    }
+    atomic_write_json(round2_manifest, round2_root / "round2_manifest.json")
+    _stage_call(
+        stage_observer,
+        "update_second_fingerprint_round",
+        staging,
+        records,
+        "post_transition_fingerprint_update_round2",
+    )
     _stage_call(stage_observer, "update_cleanup", staging, records, "reference_lp_input")
 
     metrics = (

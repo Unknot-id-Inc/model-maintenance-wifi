@@ -40,8 +40,8 @@ from fingerprint_update import (
     LocationPredictor,
     LocationToFeatureUpdater,
     UpdateEpochLoss,
-    UpdateLocationScaler,
 )
+from graph_build import require_spatial_transform
 from gufu_artifacts import (
     atomic_torch_save,
     atomic_write_json,
@@ -62,11 +62,13 @@ from streaming_update import MappedStreamingOnlineGraph, load_streaming_online_g
 from training_progress import (
     DEFAULT_LOG_EVERY_K_EPOCHS,
     log_training_epoch,
+    log_training_start,
     validate_log_interval,
 )
+from spatial_normalization import FittedSpatialTransform
 
 
-STREAM_UPDATER_FORMAT = "gufu_streaming_updater_v1"
+STREAM_UPDATER_FORMAT = "gufu_streaming_updater_v2"
 STREAM_AE_UPDATE_FORMAT = "gufu_streaming_ae_update_v2"
 STREAM_POST_TRANSITION_AE_FORMAT = "gufu_streaming_post_transition_ae_v3"
 
@@ -74,7 +76,7 @@ STREAM_POST_TRANSITION_AE_FORMAT = "gufu_streaming_post_transition_ae_v3"
 class StreamingUpdaterManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    format: Literal["gufu_streaming_updater_v1"] = STREAM_UPDATER_FORMAT
+    format: Literal["gufu_streaming_updater_v2"] = STREAM_UPDATER_FORMAT
     updater_id: str = Field(pattern=r"^streamupdater:[0-9a-f]{64}$")
     online_graph_id: str = Field(pattern=r"^onlinegraph:[0-9a-f]{64}$")
     gnn_artifact_id: str = Field(pattern=r"^streamgnn:[0-9a-f]{64}$")
@@ -97,7 +99,10 @@ class StreamingUpdaterManifest(BaseModel):
     reference_ids: tuple[str, ...]
     labeled_reference_ids: tuple[str, ...]
     update_ids: tuple[str, ...]
-    location_scaler: UpdateLocationScaler
+    location_target_space: Literal[
+        "site_unique_centroid_max_radius_2d"
+    ] = "site_unique_centroid_max_radius_2d"
+    spatial_transform_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     graph_feature_dim: int = Field(ge=3)
     encoder_feature_dim: int = Field(ge=1)
     adjacency_policy: Literal["row_normalized_cross_virtual_v1"] = (
@@ -126,7 +131,7 @@ class StreamingUpdaterManifest(BaseModel):
         if len(self.loss_history) != self.config.updater_epochs:
             raise ValueError("streaming updater loss history has an invalid epoch count")
         expected_shapes = {
-            "predicted_update_scaled_locations.npy": (len(self.update_ids), 2),
+            "predicted_update_normalized_locations.npy": (len(self.update_ids), 2),
             "predicted_update_locations.npy": (len(self.update_ids), 2),
             "updated_reference_latents.npy": (
                 len(self.labeled_reference_ids), self.encoder_feature_dim
@@ -337,17 +342,9 @@ def _seed_ae_pass(seed: int, device: torch.device) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _scaled_xy(coordinates: np.ndarray, scaler: UpdateLocationScaler) -> np.ndarray:
-    result = np.empty_like(coordinates, dtype=np.float32)
-    spans = np.asarray((scaler.x_max - scaler.x_min, scaler.y_max - scaler.y_min))
-    spans[spans == 0.0] = 1.0
-    result[:] = (coordinates - np.asarray((scaler.x_min, scaler.y_min))) / spans
-    return result
-
-
 def _adjacency_targets(
     graph: MappedStreamingOnlineGraph,
-    scaler: UpdateLocationScaler,
+    spatial_transform: FittedSpatialTransform,
     coordinates: np.ndarray,
     directory: Path,
 ):
@@ -355,7 +352,7 @@ def _adjacency_targets(
     n_label = len(graph.manifest.labeled_reference_ids)
     xy = _open(directory / "cross_reference_xy.npy", (n_update, 2))
     nonempty = np.zeros((n_update,), dtype=np.bool_)
-    y_scaled = _scaled_xy(coordinates, scaler)
+    y_normalized = spatial_transform.transform(coordinates).astype(np.float32, copy=False)
     indptr, cols, weights = (
         graph.update_reference_indptr,
         graph.update_reference_cols,
@@ -374,11 +371,11 @@ def _adjacency_targets(
             raise ValueError("cross-reference adjacency column is out of range")
         if not math.isclose(float(row_weights.sum()), 1.0, rel_tol=1e-7, abs_tol=1e-7):
             raise ValueError("nonempty cross-reference adjacency row is not normalized")
-        xy[row] = row_weights @ y_scaled[row_cols]
+        xy[row] = row_weights @ y_normalized[row_cols]
         nonempty[row] = True
     if isinstance(xy, np.memmap):
         xy.flush()
-    return xy, nonempty, y_scaled
+    return xy, nonempty, y_normalized
 
 
 def _global_losses(
@@ -388,7 +385,7 @@ def _global_losses(
     feature_model: LocationToFeatureUpdater,
     ref_rows: np.ndarray,
     update_rows: np.ndarray,
-    y_ref: np.ndarray,
+    reference_coordinates_normalized: np.ndarray,
     z_update: np.ndarray,
     cross_xy: np.ndarray,
     nonempty: np.ndarray,
@@ -410,7 +407,7 @@ def _global_losses(
         for start in range(0, len(ref_rows), chunk_size):
             stop = min(start + chunk_size, len(ref_rows))
             x = _tensor(gnn_state.node_embeddings[ref_rows[start:stop]], device)
-            y = _tensor(y_ref[start:stop], device)
+            y = _tensor(reference_coordinates_normalized[start:stop], device)
             z = feature_model(y)
             feature_ref[start:stop] = z.cpu().numpy()
             sums[0] += float((location_model(x) - y).double().square().sum().cpu())
@@ -447,7 +444,7 @@ def _accumulate_global_gradients(
     feature_model: LocationToFeatureUpdater,
     ref_rows: np.ndarray,
     update_rows: np.ndarray,
-    y_ref: np.ndarray,
+    reference_coordinates_normalized: np.ndarray,
     z_update: np.ndarray,
     cross_xy: np.ndarray,
     nonempty: np.ndarray,
@@ -469,7 +466,7 @@ def _accumulate_global_gradients(
         for start in range(0, len(ref_rows), chunk_size):
             stop = min(start + chunk_size, len(ref_rows))
             x = _tensor(gnn_state.node_embeddings[ref_rows[start:stop]], device)
-            y = _tensor(y_ref[start:stop], device)
+            y = _tensor(reference_coordinates_normalized[start:stop], device)
             residual = location_model(x) - y
             (weight_lp * residual.square().sum() / (2.0 * float(norm[0]))).backward()
 
@@ -513,7 +510,7 @@ def _accumulate_global_gradients(
             target_gradient = _tensor(grad_ref[start:stop], device)
             if not torch.count_nonzero(target_gradient).item():
                 continue
-            y = _tensor(y_ref[start:stop], device)
+            y = _tensor(reference_coordinates_normalized[start:stop], device)
             output = feature_model(y)
             (output * target_gradient).sum().backward()
 
@@ -523,7 +520,8 @@ def load_streaming_updater_warm_start(
     *,
     graph_feature_dim: int,
     encoder_feature_dim: int,
-) -> tuple[str, dict[str, Tensor], dict[str, Tensor]]:
+    spatial_transform_sha256: str,
+) -> tuple[str, str, dict[str, Tensor], dict[str, Tensor]]:
     """Load prior-batch updater weights for a fresh-optimizer continuation.
 
     Only the model weights cross the batch boundary. The previous graph and
@@ -550,6 +548,8 @@ def load_streaming_updater_warm_start(
         or manifest.encoder_feature_dim != encoder_feature_dim
     ):
         raise ValueError("previous-batch updater dimensions are incompatible with this graph")
+    if manifest.spatial_transform_sha256 != spatial_transform_sha256:
+        raise ValueError("previous-batch updater uses a different spatial transform")
     payload = load_torch_state(checkpoint_path, map_location="cpu")
     if payload.get("format") != STREAM_UPDATER_FORMAT:
         raise ValueError("unsupported previous-batch updater checkpoint format")
@@ -559,6 +559,7 @@ def load_streaming_updater_warm_start(
         raise ValueError("previous-batch updater is missing learned model weights")
     return (
         manifest.updater_id,
+        manifest.spatial_transform_sha256,
         {key: value.detach().cpu() for key, value in location.items()},
         {key: value.detach().cpu() for key, value in feature.items()},
     )
@@ -575,6 +576,7 @@ def train_streaming_updaters(
     *,
     source_ae_checkpoint_sha256: str,
     source_updater_id: str | None = None,
+    source_updater_spatial_transform_sha256: str | None = None,
     initial_location_state: dict[str, Tensor] | None = None,
     initial_feature_state: dict[str, Tensor] | None = None,
     chunk_size: int = 4096,
@@ -634,20 +636,28 @@ def train_streaming_updaters(
         raise ValueError("online graph labels differ from immutable bootstrap coordinates")
     if config.virtual_edge_sigma != gm.virtual_edge_sigma:
         raise ValueError("streamed updater virtual edge sigma differs from graph provenance")
+    resolved_graph_config, spatial_transform = require_spatial_transform(
+        gm.graph_build_config, gm.dataset_id
+    )
+    if resolved_graph_config != gm.graph_build_config:
+        raise ValueError("online graph spatial transform configuration is not resolved")
+    if (source_updater_id is None) != (source_updater_spatial_transform_sha256 is None):
+        raise ValueError("updater warm-start ID and spatial-transform identity must be supplied together")
+    if (
+        source_updater_spatial_transform_sha256 is not None
+        and source_updater_spatial_transform_sha256 != spatial_transform.transform_sha256
+    ):
+        raise ValueError("previous-batch updater uses a different spatial transform")
 
     label_ids = gm.labeled_reference_ids
     update_ids = gm.update_sample_ids
     ref_pos = {node_id: row for row, node_id in enumerate(gm.node_ids)}
     ref_rows = np.asarray([ref_pos[node_id] for node_id in label_ids], dtype=np.int64)
     update_rows = np.asarray([ref_pos[node_id] for node_id in update_ids], dtype=np.int64)
-    coordinates = np.asarray(gm.labeled_reference_coordinates, dtype=np.float32)
-    scaler = UpdateLocationScaler(
-        x_min=float(coordinates[:, 0].min()),
-        x_max=float(coordinates[:, 0].max()),
-        y_min=float(coordinates[:, 1].min()),
-        y_max=float(coordinates[:, 1].max()),
+    coordinates = np.asarray(gm.labeled_reference_coordinates, dtype=np.float64)
+    reference_coordinates_normalized = spatial_transform.transform(coordinates).astype(
+        np.float32, copy=False
     )
-    y_ref = _scaled_xy(coordinates, scaler)
     encoder_rows = {scan_id: row for row, scan_id in enumerate(update_encoder.scan_ids)}
     z_update = np.asarray(
         [update_encoder.feature_matrix[encoder_rows[scan_id]] for scan_id in update_ids],
@@ -674,8 +684,18 @@ def train_streaming_updaters(
             list(location_model.parameters()) + list(feature_model.parameters()),
             lr=config.updater_learning_rate,
         )
-        cross_xy, nonempty, _ = _adjacency_targets(graph, scaler, coordinates, staging)
+        cross_xy, nonempty, _ = _adjacency_targets(
+            graph, spatial_transform, coordinates, staging
+        )
         history: list[UpdateEpochLoss] = []
+        log_training_start(
+            "Streaming location/feature updaters",
+            {
+                "labeled_refs": len(label_ids),
+                "update_scans": len(update_ids),
+                "chunk_size": chunk_size,
+            },
+        )
         for epoch in range(1, config.updater_epochs + 1):
             optimizer.zero_grad(set_to_none=True)
             norms, feature_ref, update_xy = _global_losses(
@@ -685,7 +705,7 @@ def train_streaming_updaters(
                 feature_model,
                 ref_rows,
                 update_rows,
-                y_ref,
+                reference_coordinates_normalized,
                 z_update,
                 cross_xy,
                 nonempty,
@@ -701,7 +721,7 @@ def train_streaming_updaters(
                 feature_model,
                 ref_rows,
                 update_rows,
-                y_ref,
+                reference_coordinates_normalized,
                 z_update,
                 cross_xy,
                 nonempty,
@@ -736,9 +756,6 @@ def train_streaming_updaters(
                 config.updater_epochs,
                 {
                     **epoch_loss.model_dump(exclude={"epoch"}),
-                    "labeled_refs": len(label_ids),
-                    "update_scans": len(update_ids),
-                    "chunk_size": chunk_size,
                 },
                 every_k_epochs=log_every_epochs,
             )
@@ -752,21 +769,27 @@ def train_streaming_updaters(
 
         location_model.eval()
         feature_model.eval()
-        predicted_scaled = _open(staging / "predicted_update_scaled_locations.npy", (len(update_ids), 2))
+        predicted_normalized = _open(
+            staging / "predicted_update_normalized_locations.npy",
+            (len(update_ids), 2),
+        )
         for start in range(0, len(update_rows), chunk_size):
             stop = min(start + chunk_size, len(update_rows))
             with torch.no_grad():
                 pred = location_model(_tensor(gnn_state.node_embeddings[update_rows[start:stop]], selected_device))
-            predicted_scaled[start:stop] = pred.cpu().numpy()
+            predicted_normalized[start:stop] = pred.cpu().numpy()
         predicted_raw = _open(staging / "predicted_update_locations.npy", (len(update_ids), 2))
-        spans = np.asarray((scaler.x_max - scaler.x_min, scaler.y_max - scaler.y_min), dtype=np.float32)
-        predicted_raw[:] = np.asarray((scaler.x_min, scaler.y_min), dtype=np.float32) + predicted_scaled[:] * spans
+        predicted_raw[:] = spatial_transform.inverse_transform(
+            np.asarray(predicted_normalized, dtype=np.float64)
+        ).astype(np.float32, copy=False)
         latent_ref = _open(staging / "updated_reference_latents.npy", (len(label_ids), gm.encoder_feature_dim))
         for start in range(0, len(label_ids), chunk_size):
             stop = min(start + chunk_size, len(label_ids))
             with torch.no_grad():
-                latent_ref[start:stop] = feature_model(_tensor(y_ref[start:stop], selected_device)).cpu().numpy()
-        for arr in (predicted_scaled, predicted_raw, latent_ref):
+                latent_ref[start:stop] = feature_model(
+                    _tensor(reference_coordinates_normalized[start:stop], selected_device)
+                ).cpu().numpy()
+        for arr in (predicted_normalized, predicted_raw, latent_ref):
             if isinstance(arr, np.memmap):
                 arr.flush()
 
@@ -785,7 +808,7 @@ def train_streaming_updaters(
         arrays = tuple(
             _array_artifact(staging / name, name)
             for name in (
-                "predicted_update_scaled_locations.npy",
+                "predicted_update_normalized_locations.npy",
                 "predicted_update_locations.npy",
                 "updated_reference_latents.npy",
             )
@@ -811,7 +834,7 @@ def train_streaming_updaters(
             reference_ids=gm.reference_sample_ids,
             labeled_reference_ids=label_ids,
             update_ids=update_ids,
-            location_scaler=scaler,
+            spatial_transform_sha256=spatial_transform.transform_sha256,
             graph_feature_dim=gm.node_feature_dim,
             encoder_feature_dim=gm.encoder_feature_dim,
             chunk_size=chunk_size,
@@ -867,6 +890,12 @@ def load_streaming_updater(
         raise ValueError("streaming updater ID order differs from graph")
     if manifest.vocabulary_sha256 != gm.vocabulary_sha256 or manifest.source_gnn_checkpoint_sha256 != sm.checkpoint_sha256:
         raise ValueError("streaming updater checkpoint vocabulary/GNN provenance mismatch")
+    if (
+        not gm.graph_build_config.spatial_normalization_enabled
+        or manifest.spatial_transform_sha256
+        != gm.graph_build_config.spatial_transform_sha256
+    ):
+        raise ValueError("streaming updater checkpoint uses a different spatial transform")
     if verify_hashes and sha256_file(checkpoint_path) != manifest.checkpoint_sha256:
         raise ValueError("streaming updater checkpoint hash mismatch")
     payload = load_torch_state(checkpoint_path, map_location="cpu")
@@ -988,6 +1017,14 @@ def train_streaming_ae_update(
     )
     loss_history: list[tuple[float, float, float, float]] = []
     saved_rng_state: dict[str, object] = {}
+    log_training_start(
+        "Streaming batch AE Eq. (10)",
+        {
+            "labeled_reference_scans": len(labeled_scans),
+            "APs": len(rm.bssid_vocabulary),
+            "chunk_size": chunk_size,
+        },
+    )
 
     with torch.random.fork_rng(devices=cuda_devices):
         for epoch in range(1, config.ae_epochs + 1):
@@ -1054,9 +1091,6 @@ def train_streaming_ae_update(
                     "latent_frobenius": float(norms[1]),
                     "decoder_frobenius": float(norms[2]),
                     "total": float(norms[0] + 0.5 * (norms[1] + norms[2])),
-                    "labeled_reference_scans": len(labeled_scans),
-                    "APs": len(rm.bssid_vocabulary),
-                    "chunk_size": chunk_size,
                 },
                 every_k_epochs=log_every_epochs,
             )
@@ -1309,12 +1343,13 @@ def load_streaming_ae_update(
 
 def _transition_ae_chunk(
     transition_state, rows: np.ndarray, normalization: str
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     values = np.asarray(transition_state.updated_rssi_dbm[rows], dtype=np.float64)
     masks = np.asarray(transition_state.observation_mask[rows], dtype=np.uint8)
     origins = np.asarray(transition_state.value_provenance[rows], dtype=np.uint8)
     # Eq. (13) edge scores are graph weights, never AE input or targets.
-    # Prior decoder estimates can be inputs, but only measured RSS is a target.
+    # Prior decoder estimates can be inputs; unresolved cells use the normalized
+    # missing-value sentinel and remain part of the dense reconstruction target.
     usable = (masks != 0) | (origins == 1)
     matrix = np.empty_like(values, dtype=np.float32)
     for row in range(len(rows)):
@@ -1323,7 +1358,7 @@ def _transition_ae_chunk(
             tuple(bool(value) for value in usable[row]),
             normalization,
         )
-    return matrix[:, None, :], (masks != 0)[:, None, :].astype(np.float32)
+    return matrix[:, None, :]
 
 
 def _update_ae_chunk(
@@ -1331,7 +1366,7 @@ def _update_ae_chunk(
     rows: np.ndarray,
     target_vocabulary: tuple[str, ...],
     normalization: str,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     """Map actual update-batch measurements into the expanded AE vocabulary."""
     source_column = {
         bssid: column
@@ -1355,7 +1390,7 @@ def _update_ae_chunk(
         matrix[row] = raw_dbm_row_to_ae(
             raw[row], tuple(bool(value) for value in observed[row]), normalization
         )
-    return matrix[:, None, :], observed[:, None, :].astype(np.float32)
+    return matrix[:, None, :]
 
 
 def fine_tune_streaming_ae_after_ap_transition(
@@ -1375,10 +1410,10 @@ def fine_tune_streaming_ae_after_ap_transition(
 
     AP migration is applied to the trained AE weights before this call. Shared
     slices and returning AP archives therefore remain real learned state. The
-    reconstruction term uses measured RSS from the unlabeled update batch,
-    with missing cells masked out, plus an anchored reference reconstruction
-    term. Eq. (13) scores remain graph weights and are excluded from AE inputs
-    and targets. The fitted decoder fills unavailable values for all retained
+    reconstruction terms use full normalized RSS vectors, including the
+    missing-value sentinel, for the update batch and reference anchors. Eq.
+    (13) scores remain graph weights and are excluded from AE inputs and
+    targets. The fitted decoder fills unavailable values for all retained
     reference scans, while immutable labeled-reference latent targets remain
     the Eq. (9) anchor.
     """
@@ -1505,6 +1540,16 @@ def fine_tune_streaming_ae_after_ap_transition(
     history: list[tuple[float, float, float]] = []
     saved_rng_state: dict[str, object] = {}
     label_target_rows = updater_state.updated_reference_latents
+    log_training_start(
+        "Streaming post-transition AE Eq. (10) + measured update RSS",
+        {
+            "labeled_reference_scans": len(label_rows),
+            "unlabeled_update_scans": len(update_prepared.scans),
+            "update_observed_rssi_targets": update_observed_readings,
+            "APs": len(tm.vocabulary_after),
+            "chunk_size": chunk_size,
+        },
+    )
     with torch.random.fork_rng(devices=cuda_devices):
         for epoch in range(1, config.ae_epochs + 1):
             epoch_seed = config.seed + 1303 + epoch
@@ -1515,28 +1560,26 @@ def fine_tune_streaming_ae_after_ap_transition(
                 for start in range(0, len(label_rows), chunk_size):
                     stop = min(start + chunk_size, len(label_rows))
                     rows = label_rows[start:stop]
-                    x_values, reconstruction_mask = _transition_ae_chunk(
+                    x_values = _transition_ae_chunk(
                         transition_state, rows, tm.normalization
                     )
                     x = _tensor(x_values, selected_device)
-                    loss_mask = _tensor(reconstruction_mask, selected_device)
                     z_target = _tensor(label_target_rows[start:stop], selected_device).detach()
                     z, reconstruction = model(x)
                     target_reconstruction = model.D(z_target.unsqueeze(1))
-                    residual = (reconstruction - x) * loss_mask
+                    residual = reconstruction - x
                     squared[0] += float(residual.double().square().sum().cpu())
                     squared[2] += float((z[:, 0, :] - z_target).double().square().sum().cpu())
                     squared[3] += float((target_reconstruction - reconstruction).double().square().sum().cpu())
                 for start in range(0, len(update_prepared.scans), chunk_size):
                     stop = min(start + chunk_size, len(update_prepared.scans))
                     rows = np.arange(start, stop, dtype=np.int64)
-                    x_values, reconstruction_mask = _update_ae_chunk(
+                    x_values = _update_ae_chunk(
                         update_prepared, rows, tm.vocabulary_after, tm.normalization
                     )
                     x = _tensor(x_values, selected_device)
-                    loss_mask = _tensor(reconstruction_mask, selected_device)
                     _, reconstruction = model(x)
-                    residual = (reconstruction - x) * loss_mask
+                    residual = reconstruction - x
                     squared[1] += float(residual.double().square().sum().cpu())
             reference_reconstruction_norm = float(np.sqrt(squared[0]))
             update_reconstruction_norm = float(np.sqrt(squared[1]))
@@ -1555,17 +1598,16 @@ def fine_tune_streaming_ae_after_ap_transition(
             for start in range(0, len(label_rows), chunk_size):
                 stop = min(start + chunk_size, len(label_rows))
                 rows = label_rows[start:stop]
-                x_values, reconstruction_mask = _transition_ae_chunk(
+                x_values = _transition_ae_chunk(
                     transition_state, rows, tm.normalization
                 )
                 x = _tensor(x_values, selected_device)
-                loss_mask = _tensor(reconstruction_mask, selected_device)
                 z_target = _tensor(label_target_rows[start:stop], selected_device).detach()
                 z, reconstruction = model(x)
                 target_reconstruction = model.D(z_target.unsqueeze(1))
                 objective = reconstruction.sum() * 0.0
                 if reference_reconstruction_norm > 0.0:
-                    residual = (reconstruction - x) * loss_mask
+                    residual = reconstruction - x
                     objective = objective + 0.5 * residual.square().sum() / reference_reconstruction_norm
                 if norms[1] > 0.0:
                     objective = objective + 0.5 * (z[:, 0, :] - z_target).square().sum() / (2.0 * float(norms[1]))
@@ -1575,14 +1617,13 @@ def fine_tune_streaming_ae_after_ap_transition(
             for start in range(0, len(update_prepared.scans), chunk_size):
                 stop = min(start + chunk_size, len(update_prepared.scans))
                 rows = np.arange(start, stop, dtype=np.int64)
-                x_values, reconstruction_mask = _update_ae_chunk(
+                x_values = _update_ae_chunk(
                     update_prepared, rows, tm.vocabulary_after, tm.normalization
                 )
                 x = _tensor(x_values, selected_device)
-                loss_mask = _tensor(reconstruction_mask, selected_device)
                 _, reconstruction = model(x)
                 if update_reconstruction_norm > 0.0:
-                    residual = (reconstruction - x) * loss_mask
+                    residual = reconstruction - x
                     objective = 0.5 * residual.square().sum() / update_reconstruction_norm
                     objective.backward()
             gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
@@ -1602,11 +1643,6 @@ def fine_tune_streaming_ae_after_ap_transition(
                     "update_reconstruction_frobenius": update_reconstruction_norm,
                     "latent_frobenius": float(norms[1]),
                     "decoder_frobenius": float(norms[2]),
-                    "labeled_reference_scans": len(label_rows),
-                    "unlabeled_update_scans": len(update_prepared.scans),
-                    "update_observed_rssi_targets": update_observed_readings,
-                    "APs": len(tm.vocabulary_after),
-                    "chunk_size": chunk_size,
                 },
                 every_k_epochs=log_every_epochs,
             )
@@ -1631,7 +1667,7 @@ def fine_tune_streaming_ae_after_ap_transition(
         for start in range(0, n_reference, chunk_size):
             stop = min(start + chunk_size, n_reference)
             rows = np.arange(start, stop, dtype=np.int64)
-            x_values, _ = _transition_ae_chunk(
+            x_values = _transition_ae_chunk(
                 transition_state, rows, tm.normalization
             )
             x = _tensor(x_values, selected_device)

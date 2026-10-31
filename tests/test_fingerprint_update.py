@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import numpy as np
@@ -35,6 +36,7 @@ from gufu_artifacts import canonical_json_digest
 from gufu_data import PreprocessingConfig, PreparedDataset, prepare_dataset_files
 from gufu_data import ae_value_to_raw_dbm
 from lp import LinkPredictionConfig, predict_edges
+from rssi_pairs import RSSI_SIMILARITY_SPACE
 from sage_ve import (
     EdgeFeatureSAGE,
     GNNModelConfig,
@@ -69,6 +71,7 @@ from streaming_transition import (
     materialize_streaming_reference_prepared,
 )
 from streaming_fingerprint_update import (
+    _adjacency_targets,
     fine_tune_streaming_ae_after_ap_transition,
     load_streaming_ae_update,
     load_streaming_post_transition_ae,
@@ -76,6 +79,7 @@ from streaming_fingerprint_update import (
     train_streaming_ae_update,
     train_streaming_updaters,
 )
+from spatial_normalization import fit_spatial_transform
 from streaming_gnn import (
     _StreamedEquation4,
     _forward_stream,
@@ -152,10 +156,21 @@ def pipeline(tmp_path_factory) -> PipelineFixture:
     update_encoder = encode_prepared_dataset(
         update, ae_path, root / "update-features.json", batch_size=1
     )
+    spatial_path = root / "spatial" / "update-test.json"
+    transform = fit_spatial_transform(
+        [(position.x, position.y) for position in reference.training_reference_positions()],
+        reference.config.dataset_id,
+        provenance={"source": "test bootstrap training positions"},
+    )
+    transform.save(spatial_path)
     graph_config = GraphBuildConfig(
         virtual_edge_strategy="paper_cosine_threshold",
-        virtual_edge_sigma=1.0,
+        virtual_edge_sigma=0.993,
+        negative_similarity_threshold=0.992,
+        minimum_shared_aps=1,
         pseudo_location_seed=13,
+        spatial_normalization_enabled=True,
+        spatial_transform_path=str(spatial_path),
     )
     graph = build_graph_state(reference, ref_encoder, graph_config)
     gnn_path = root / "base-gnn.pt"
@@ -194,7 +209,7 @@ def small_update_config(**overrides) -> FingerprintUpdateConfig:
     values = dict(
         hidden_dim=8,
         alpha=0.5,
-        virtual_edge_sigma=-0.999,
+        virtual_edge_sigma=0.993,
         gnn_epochs=1,
         updater_epochs=3,
         ae_epochs=1,
@@ -307,15 +322,47 @@ def test_equation10_terms_match_reference_and_reach_encoder_decoder_gradients():
     assert any(parameter.grad is not None and torch.count_nonzero(parameter.grad) for parameter in model.D.parameters())
 
 
+def test_streaming_adjacency_targets_share_reference_spatial_transform(tmp_path):
+    raw_coordinates = np.asarray([(0.0, 0.0), (100.0, 10.0)], dtype=np.float64)
+    transform = fit_spatial_transform(raw_coordinates, "stream-site")
+    weights = np.asarray([0.25, 0.75], dtype=np.float64)
+    graph = SimpleNamespace(
+        manifest=SimpleNamespace(
+            update_sample_ids=("update:0",),
+            labeled_reference_ids=("reference:0", "reference:1"),
+        ),
+        update_reference_indptr=np.asarray([0, 2], dtype=np.int64),
+        update_reference_cols=np.asarray([0, 1], dtype=np.int64),
+        update_reference_values=weights,
+    )
+
+    cross_targets, nonempty, normalized = _adjacency_targets(
+        graph, transform, raw_coordinates, tmp_path
+    )
+
+    expected_normalized = transform.transform(raw_coordinates).astype(np.float32)
+    np.testing.assert_allclose(normalized, expected_normalized)
+    np.testing.assert_allclose(cross_targets[0], weights @ expected_normalized)
+    assert nonempty.tolist() == [True]
+
+
 def test_online_update_training_preserves_reference_ids_locations_and_shapes(pipeline, tmp_path):
     context = make_context(pipeline)
+    raw_coordinates = context.reference_coordinates_raw.clone()
+    normalized_coordinates, _ = _coordinate_training_tensors(context)
+    torch.testing.assert_close(
+        normalized_coordinates,
+        context.spatial_transform.transform(raw_coordinates).to(torch.float32),
+    )
+    torch.testing.assert_close(context.reference_coordinates_raw, raw_coordinates)
     assert context.online_graph.node_features
     assert len(context.online_graph.update_sample_ids) == len(pipeline.update.scans)
     assert context.adjacency.shape == (
         len(pipeline.update.scans),
         len(pipeline.reference.reference_positions),
     )
-    assert torch.allclose(context.adjacency.sum(dim=1), torch.ones(len(pipeline.update.scans)))
+    assert torch.isfinite(context.adjacency).all()
+    assert torch.all(context.adjacency.sum(dim=1) <= 1.0)
     assert context.tensors.node_features.shape == (len(context.online_graph.node_ids), 34)
     assert context.tensors.edge_features.shape == (
         len(context.online_graph.radio_edges) + len(context.online_graph.virtual_edges),
@@ -370,6 +417,7 @@ def test_online_update_training_preserves_reference_ids_locations_and_shapes(pip
     assert all(torch.isfinite(torch.tensor(value)) for value in trained.models.manifest.ae_loss_history)
     assert trained.models.manifest.update_coordinates_used_as_training_labels is False
     assert trained.models.manifest.temporary_nodes_and_virtual_edges_retired is True
+    assert trained.models.manifest.spatial_transform_sha256 == context.spatial_transform.transform_sha256
 
 
 def test_checkpoint_reload_reproduces_inference_and_rejects_identity_mismatch(pipeline, tmp_path):
@@ -622,7 +670,7 @@ def test_streaming_online_graph_matches_updater_by_stable_ids(pipeline, tmp_path
     assert actual_manifest.node_ids == expected.node_ids
     assert actual_manifest.online_graph_id.startswith("onlinegraph:")
     assert actual_manifest.labeled_reference_ids == expected.labeled_reference_ids
-    assert actual_manifest.similarity_feature_space == "z_encoder_signal_only_v1"
+    assert actual_manifest.similarity_feature_space == RSSI_SIMILARITY_SPACE
     np.testing.assert_allclose(
         streamed.sample_signal_features,
         np.asarray(expected.sample_signal_features),
@@ -993,7 +1041,7 @@ def test_streaming_gnn_chunked_gradient_and_reload_match_full_graph(pipeline, tm
     assert online_lp_result.manifest.gnn_checkpoint_sha256 == streamed.manifest.checkpoint_sha256
 
     updater_config = small_update_config(
-        virtual_edge_sigma=1.0,
+        virtual_edge_sigma=pipeline.graph.build_config.virtual_edge_sigma,
         gnn_epochs=1,
         updater_epochs=1,
         seed=71,
@@ -1130,8 +1178,12 @@ def test_streaming_online_lp_extension_initializes_new_ap_by_full_identity(
         pipeline.reference_encoder,
         GraphBuildConfig(
             virtual_edge_strategy="paper_cosine_threshold",
-            virtual_edge_sigma=-1.0,
+            virtual_edge_sigma=0.993,
+            negative_similarity_threshold=0.992,
+            minimum_shared_aps=1,
             pseudo_location_seed=13,
+            spatial_normalization_enabled=True,
+            spatial_transform_path=pipeline.graph.build_config.spatial_transform_path,
         ),
     )
     transition_gnn_checkpoint_path = tmp_path / "transition-source-gnn.pt"
@@ -1208,7 +1260,7 @@ def test_streaming_online_lp_extension_initializes_new_ap_by_full_identity(
         projected_update,
         update_encoder,
         online_graph_path,
-        virtual_edge_sigma=-1.0,
+        virtual_edge_sigma=transition_graph.build_config.virtual_edge_sigma,
     )
     source_gnn = load_gnn_checkpoint(
         transition_gnn_checkpoint_path, transition_graph, device="cpu"
@@ -1230,7 +1282,7 @@ def test_streaming_online_lp_extension_initializes_new_ap_by_full_identity(
     update_config = FingerprintUpdateConfig(
         hidden_dim=8,
         alpha=0.5,
-        virtual_edge_sigma=-1.0,
+        virtual_edge_sigma=transition_graph.build_config.virtual_edge_sigma,
         updater_epochs=1,
         ae_epochs=1,
         seed=73,
