@@ -883,7 +883,7 @@ The bounded real smoke is not a full paper configuration: `virtual_edge_sigma=1.
 
 - `pred.py`: stable manifest artifact-index keys for incoming prepared/projection/update artifacts.
 - `gufu_evaluation.py`: strict, post-fit RSSI-reference and held-out localization metrics with separate units, truth source, and estimator identity.
-- `gufu.py`: cell 9 uses the metric APIs and reports RSSI dBm agreement separately from 2-D coordinate RMSE.
+- `gufu.py`: cell 9 uses the metric APIs and reports RSSI dBm agreement separately from mean Euclidean location error; RMSE is supplemental.
 - `tests/test_orchestrator.py`: unlabeled multi-batch end-to-end fixture, trained-artifact/graph/AP/LP handoff assertions, controlled feature change and rejection checks, missing artifact, unrelated-file preservation, and fresh-process resume comparison.
 - `tests/test_gufu_evaluation.py`, `tests/test_gufu_notebook.py`: reference metric calculations and updated cell contract.
 - `README.md`, `docs/gufu_validation.md`: current operation and validation record.
@@ -923,9 +923,9 @@ MSE and squared Frobenius error have the same minimizers for one fixed residual 
 
 ### AE objective switch
 
-- `gufu.py` cell 1 exposes `AE_LOSS`, with supported values `"mean_squared_error"` and `"batch_frobenius_norm"`. Both real and CPU-smoke configs pass this field through to `AETrainingConfig`; cell 1 prints the selected objective.
-- The derived `RUN_ID` and per-run AE/feature/pipeline paths include `mse` or `frobenius`. Switching the selector therefore starts/reuses that objective's own validated artifacts rather than reusing the other objective's weights. `AE_ACTION="load"` remains inference from the explicitly selected checkpoint; its stored objective is authoritative and the selector does not retrain it.
-- Direct `train_autoencoder` callers use the same config field. MSE logs and stores an element-weighted mean over all minibatch residual entries. Frobenius mode optimizes the raw residual norm of each minibatch and stores the arithmetic mean of minibatch norms for an epoch; that norm naturally grows with minibatch size. Resume requires the objective to match the source config. A distinct objective can be explored with fresh initialization or the explicit weights-only path, not resume.
+- `gufu.py` cell 1 exposes `AE_LOSS`, with current supported values `"mean_squared_error"`, `"batch_frobenius_norm"`, and `"variational_mse_kl"`. Both real and CPU-smoke configs pass this field and `AE_VAE_KL_WEIGHT` through to `AETrainingConfig`; cell 1 prints the selected objective and coefficient.
+- The derived `RUN_ID` and per-run AE/feature/pipeline paths include the selected loss tag; MSE+KL tags also encode the KL coefficient. Switching the selector therefore starts/reuses that objective's own validated artifacts rather than reusing another objective's weights. `AE_ACTION="load"` remains inference from the explicitly selected checkpoint; its stored objective is authoritative and the selector does not retrain it.
+- Direct `train_autoencoder` callers use the same config field. MSE logs and stores an element-weighted mean over all minibatch residual entries. Frobenius mode optimizes the raw residual norm of each minibatch and stores the arithmetic mean of minibatch norms for an epoch; that norm naturally grows with minibatch size. Variational MSE+KL samples a diagonal-Gaussian latent and optimizes dense element-mean MSE plus `vae_kl_weight` times per-scan KL summed over latent coordinates; inference uses the posterior mean. Resume requires the objective and coefficient to match the source config. A distinct objective can be explored with fresh initialization or the explicit weights-only path, not resume.
 - Added a test that trains both modes on a tiny prepared dataset, checks their separate checkpoint/history definitions and log labels, and verifies objective changes are rejected for resume. The notebook source test checks the selector and objective-specific run ID.
 
 ### AE architecture controls
@@ -956,7 +956,7 @@ These measurements explain the checked-in run, not every possible seed, dataset,
 - `tests/test_sage_ve.py` remains the existing equation/gradient-path coverage; no GNN regression test was added because this follow-up changes no GNN computation.
 - The loss values and graph counts above came from a read-only inspection of the saved real-data artifacts available earlier in the analysis, not an end-to-end or held-out localization experiment. At final verification, `graph_state.json` and `checkpoints/gnn.pt` were absent from that run directory, so the metrics could not be reloaded a second time. They were not recreated or overwritten.
 - Commands: `PYTHONDONTWRITEBYTECODE=1 /home/oem/micromamba/envs/py314/bin/python -m pytest -q -p no:cacheprovider tests/test_ae.py tests/test_gufu_notebook.py` — **14 passed**; `PYTHONDONTWRITEBYTECODE=1 /home/oem/micromamba/envs/py314/bin/python -m pytest -q -p no:cacheprovider tests` — **82 passed**, 19 PyTorch 2.12 deprecation warnings; `PYTHONPYCACHEPREFIX=/tmp/gufu_ae_switch_pycache PYTHONDONTWRITEBYTECODE=1 /home/oem/micromamba/envs/py314/bin/python -m py_compile ae.py gufu.py tests/test_ae.py tests/test_gufu_notebook.py` — passed; `git diff --check` — passed.
-- No `gufu.py` cells, real-data training run, or held-out localization evaluation were executed in this follow-up. For interactive comparison, set `AE_LOSS` in cell 1 and run cells **1–3** for AE-only stepwise inspection, or **1–8** for a complete fitting/update run; the MSE and Frobenius run paths are distinct.
+- No `gufu.py` cells, real-data training run, or held-out localization evaluation were executed in this follow-up. For interactive comparison, set `AE_LOSS` in cell 1 and run cells **1–3** for AE-only stepwise inspection, or **1–8** for a complete fitting/update run; each objective receives a distinct run path.
 
 ## Simple GNN training notebook (standalone learning aid)
 
